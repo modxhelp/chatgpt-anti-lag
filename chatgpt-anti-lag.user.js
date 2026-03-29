@@ -2,7 +2,7 @@
 // @name         ChatGPT Anti-Lag
 // @name:ru      ChatGPT Anti-Lag — облегчение длинных чатов
 // @namespace    https://chatgpt.com/
-// @version      1.1.0
+// @version      1.1.1
 // @description  Makes long ChatGPT chats lighter by hiding or virtualizing old messages, with a compact control panel.
 // @description:ru  Уменьшает лаги в длинных чатах ChatGPT: скрывает или виртуализирует старые сообщения и даёт быстрое управление.
 // @author       Nikita + ChatGPT
@@ -60,6 +60,8 @@
     lastUrl: location.href,
     currentChatKey: getChatKey(),
     statusText: 'Ожидание.',
+    autoResolvedMode: 'soft',
+    appliedMode: null,
     stats: {
       totalMessages: 0,
       renderedMessages: 0,
@@ -480,14 +482,34 @@
     state.stats.savedPercent = savedPercent;
   }
 
+  function getCollapsibleCount(totalMessages) {
+    return Math.max(0, totalMessages - state.cfg.KEEP_OPEN);
+  }
+
   function getEffectiveMode() {
     if (state.cfg.mode !== 'auto') return state.cfg.mode;
 
     refreshStats();
 
-    if (state.stats.totalMessages >= state.cfg.HARD_MODE_TOTAL_MESSAGES) return 'hard';
-    if ((state.stats.softHiddenMessages + state.stats.hardSpacerMessages) >= state.cfg.HARD_MODE_HIDDEN_MESSAGES) return 'hard';
-    return 'soft';
+    const totalMessages = state.stats.totalMessages;
+    const collapsibleCount = getCollapsibleCount(totalMessages);
+    const enterHard = (
+      totalMessages >= state.cfg.HARD_MODE_TOTAL_MESSAGES ||
+      collapsibleCount >= state.cfg.HARD_MODE_HIDDEN_MESSAGES
+    );
+
+    const leaveHardTotal = Math.max(state.cfg.KEEP_OPEN + 1, state.cfg.HARD_MODE_TOTAL_MESSAGES - 3);
+    const leaveHardCollapsible = Math.max(0, state.cfg.HARD_MODE_HIDDEN_MESSAGES - 2);
+
+    if (state.autoResolvedMode === 'hard') {
+      if (totalMessages <= leaveHardTotal && collapsibleCount <= leaveHardCollapsible) {
+        state.autoResolvedMode = 'soft';
+      }
+    } else {
+      state.autoResolvedMode = enterHard ? 'hard' : 'soft';
+    }
+
+    return state.autoResolvedMode;
   }
 
   function findScrollContainer() {
@@ -632,7 +654,6 @@
   }
 
   function applySoftMode() {
-    restoreHard();
     const articles = getRenderedArticles();
     ensureVirtualIdsForArticles(articles);
 
@@ -643,11 +664,15 @@
       return;
     }
 
-    restoreSoft();
+    const keepFromIndex = Math.max(0, articles.length - state.cfg.KEEP_OPEN);
 
-    const hideLimit = Math.max(0, articles.length - state.cfg.KEEP_OPEN);
-    for (let i = 0; i < hideLimit; i += 1) {
-      markSoftHidden(articles[i]);
+    for (let i = 0; i < articles.length; i += 1) {
+      const article = articles[i];
+      if (i < keepFromIndex) {
+        markSoftHidden(article);
+      } else {
+        unmarkSoftHidden(article);
+      }
     }
 
     refreshStats();
@@ -659,8 +684,6 @@
   }
 
   function applyHardMode() {
-    restoreSoft();
-
     if (isStreaming()) {
       refreshStats();
       setStatus('Жёсткий режим: ответ ещё генерируется, виртуализация ждёт.');
@@ -713,12 +736,22 @@
 
     if (!state.cfg.enabled) {
       restoreAllForCurrentChat();
+      state.appliedMode = null;
       setStatus('Антилаг выключен.');
       updateUI();
       return;
     }
 
     const effectiveMode = getEffectiveMode();
+
+    if (state.appliedMode !== effectiveMode) {
+      if (effectiveMode === 'hard') {
+        restoreSoft();
+      } else {
+        restoreHard();
+      }
+      state.appliedMode = effectiveMode;
+    }
 
     if (effectiveMode === 'hard') {
       applyHardMode();
@@ -744,6 +777,8 @@
     restoreAllForCurrentChat();
     state.articleMap.clear();
     state.nextVirtualId = 1;
+    state.autoResolvedMode = 'soft';
+    state.appliedMode = null;
     state.lastUrl = currentUrl;
     state.currentChatKey = currentChatKey;
     setStatus('Открыт другой чат.');
@@ -932,6 +967,8 @@
       const idx = order.indexOf(state.cfg.mode);
       state.cfg.mode = order[(idx + 1) % order.length];
       saveCfg();
+      state.autoResolvedMode = 'soft';
+      state.appliedMode = null;
       restoreAllForCurrentChat();
       scheduleMaintenance(0);
     });
@@ -943,6 +980,8 @@
       if (next === state.cfg.KEEP_OPEN) return;
       state.cfg.KEEP_OPEN = next;
       saveCfg();
+      state.autoResolvedMode = 'soft';
+      state.appliedMode = null;
       restoreAllForCurrentChat();
       scheduleMaintenance(0);
     });
@@ -954,6 +993,8 @@
       if (next === state.cfg.KEEP_OPEN) return;
       state.cfg.KEEP_OPEN = next;
       saveCfg();
+      state.autoResolvedMode = 'soft';
+      state.appliedMode = null;
       restoreAllForCurrentChat();
       scheduleMaintenance(0);
     });
@@ -963,6 +1004,8 @@
       event.stopPropagation();
       state.cfg.enabled = false;
       saveCfg();
+      state.autoResolvedMode = 'soft';
+      state.appliedMode = null;
       restoreAllForCurrentChat();
       setStatus('Все сообщения показаны. Антилаг выключен.');
       updateUI();
@@ -1032,6 +1075,8 @@
     patchHistory();
     startObserver();
     attachOrUpdateScrollListener();
+    state.autoResolvedMode = 'soft';
+    state.appliedMode = null;
     setStatus(`Антилаг включён. Текущий режим: ${getModeLabel(getEffectiveMode())}.`);
     updateUI();
 
