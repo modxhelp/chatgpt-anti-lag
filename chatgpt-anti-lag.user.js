@@ -2,7 +2,7 @@
 // @name         ChatGPT Anti-Lag
 // @name:ru      ChatGPT Anti-Lag — облегчение длинных чатов
 // @namespace    https://chatgpt.com/
-// @version      1.1.1
+// @version      1.1.2
 // @description  Makes long ChatGPT chats lighter by hiding or virtualizing old messages, with a compact control panel.
 // @description:ru  Уменьшает лаги в длинных чатах ChatGPT: скрывает или виртуализирует старые сообщения и даёт быстрое управление.
 // @author       Nikita + ChatGPT
@@ -15,7 +15,7 @@
 (function () {
   'use strict';
 
-  const LS_KEY = 'cg_anti_lag_cfg_v110';
+  const LS_KEY = 'cg_anti_lag_cfg_v112';
   const UI_ID = 'cg-anti-lag-root';
   const PRIMARY_ARTICLE_SELECTOR = 'article[data-testid^="conversation-turn-"]';
   const FALLBACK_ARTICLE_SELECTOR = '[data-message-author-role]';
@@ -62,6 +62,11 @@
     statusText: 'Ожидание.',
     autoResolvedMode: 'soft',
     appliedMode: null,
+    softCollapsed: false,
+    suppressScrollUntil: 0,
+    lastScrollTop: 0,
+    lastUserScrollAt: 0,
+    lastScrollDirection: 'none',
     stats: {
       totalMessages: 0,
       renderedMessages: 0,
@@ -319,6 +324,21 @@
     document.head.appendChild(style);
   }
 
+  function nowMs() {
+    if (typeof performance !== 'undefined' && typeof performance.now === 'function') {
+      return performance.now();
+    }
+    return Date.now();
+  }
+
+  function suppressScrollReactions(ms) {
+    state.suppressScrollUntil = Math.max(state.suppressScrollUntil, nowMs() + Math.max(0, ms || 0));
+  }
+
+  function shouldIgnoreScrollEvent() {
+    return nowMs() < state.suppressScrollUntil;
+  }
+
   function clamp(n, min, max) {
     return Math.min(max, Math.max(min, n));
   }
@@ -520,17 +540,31 @@
     const firstMessage = document.querySelector(PRIMARY_ARTICLE_SELECTOR) || document.querySelector(FALLBACK_ARTICLE_SELECTOR);
 
     if (firstMessage instanceof HTMLElement) {
+      let bestCandidate = null;
       let ancestor = firstMessage.parentElement;
+
       while (ancestor && ancestor !== document.body && ancestor !== document.documentElement) {
         const styles = window.getComputedStyle(ancestor);
         const overflowY = styles.overflowY;
-        const isScrollable = (overflowY === 'auto' || overflowY === 'scroll') && ancestor.scrollHeight > ancestor.clientHeight + 8;
-        if (isScrollable) return ancestor;
+        const isScrollableStyle = overflowY === 'auto' || overflowY === 'scroll' || overflowY === 'overlay';
+        if (isScrollableStyle) {
+          bestCandidate = ancestor;
+          if (ancestor.scrollHeight > ancestor.clientHeight + 8) {
+            state.scrollElement = ancestor;
+            return ancestor;
+          }
+        }
         ancestor = ancestor.parentElement;
+      }
+
+      if (bestCandidate) {
+        state.scrollElement = bestCandidate;
+        return bestCandidate;
       }
     }
 
-    return document.scrollingElement || document.documentElement || document.body;
+    state.scrollElement = document.scrollingElement || document.documentElement || document.body;
+    return state.scrollElement;
   }
 
   function getViewportMetrics() {
@@ -635,8 +669,10 @@
   }
 
   function restoreAllForCurrentChat() {
+    suppressScrollReactions(200);
     restoreHard();
     restoreSoft();
+    state.softCollapsed = false;
     refreshStats();
     updateUI();
   }
@@ -657,14 +693,33 @@
     const articles = getRenderedArticles();
     ensureVirtualIdsForArticles(articles);
 
-    if (!isNearBottom()) {
+    const nearBottom = isNearBottom();
+    const userMovedRecently = (nowMs() - state.lastUserScrollAt) < 900;
+    const userMovedUp = userMovedRecently && state.lastScrollDirection === 'up';
+
+    if (!nearBottom && state.softCollapsed && userMovedUp) {
+      suppressScrollReactions(120);
       restoreSoft();
+      state.softCollapsed = false;
       refreshStats();
-      setStatus('Мягкий режим: прокрутка не внизу, старые сообщения временно показаны.');
+      setStatus('Мягкий режим: показаны старые сообщения, потому что ты ушёл вверх по чату.');
+      return;
+    }
+
+    if (!nearBottom && !state.softCollapsed) {
+      refreshStats();
+      setStatus('Мягкий режим: чат не у нижней границы, старые сообщения оставлены видимыми.');
+      return;
+    }
+
+    if (!nearBottom && state.softCollapsed) {
+      refreshStats();
+      setStatus('Мягкий режим: сохранено текущее скрытие, пока не будет явной прокрутки вверх.');
       return;
     }
 
     const keepFromIndex = Math.max(0, articles.length - state.cfg.KEEP_OPEN);
+    suppressScrollReactions(120);
 
     for (let i = 0; i < articles.length; i += 1) {
       const article = articles[i];
@@ -675,6 +730,7 @@
       }
     }
 
+    state.softCollapsed = keepFromIndex > 0;
     refreshStats();
     if (state.stats.softHiddenMessages > 0) {
       setStatus(`Мягкий режим: скрыто ${state.stats.softHiddenMessages} старых сообщений.`);
@@ -690,12 +746,16 @@
       return;
     }
 
+    state.softCollapsed = false;
+
     const articles = getRenderedArticles();
     ensureVirtualIdsForArticles(articles);
 
     const nodes = getConversationNodes();
     const keepTailIds = getTailProtectedIds(nodes);
     const viewport = getViewportMetrics();
+
+    suppressScrollReactions(120);
 
     for (const node of nodes) {
       if (!(node instanceof HTMLElement)) continue;
@@ -745,8 +805,10 @@
     const effectiveMode = getEffectiveMode();
 
     if (state.appliedMode !== effectiveMode) {
+      suppressScrollReactions(160);
       if (effectiveMode === 'hard') {
         restoreSoft();
+        state.softCollapsed = false;
       } else {
         restoreHard();
       }
@@ -779,6 +841,9 @@
     state.nextVirtualId = 1;
     state.autoResolvedMode = 'soft';
     state.appliedMode = null;
+    state.lastScrollTop = 0;
+    state.lastUserScrollAt = 0;
+    state.lastScrollDirection = 'none';
     state.lastUrl = currentUrl;
     state.currentChatKey = currentChatKey;
     setStatus('Открыт другой чат.');
@@ -839,14 +904,38 @@
     let lastCheckTime = 0;
     let frameId = null;
 
-    const now = typeof performance !== 'undefined' && typeof performance.now === 'function'
-      ? () => performance.now()
-      : () => Date.now();
+    const getScrollTop = () => {
+      if (
+        scrollContainer instanceof HTMLElement &&
+        scrollContainer !== document.body &&
+        scrollContainer !== document.documentElement
+      ) {
+        return scrollContainer.scrollTop;
+      }
+      const root = document.scrollingElement || document.documentElement;
+      return root.scrollTop;
+    };
+
+    state.lastScrollTop = getScrollTop();
 
     const runCheck = () => {
-      const currentTime = now();
+      const currentTime = nowMs();
       if (currentTime - lastCheckTime < state.cfg.SCROLL_THROTTLE_MS) return;
       lastCheckTime = currentTime;
+
+      const currentScrollTop = getScrollTop();
+      const delta = currentScrollTop - state.lastScrollTop;
+
+      if (!shouldIgnoreScrollEvent()) {
+        if (Math.abs(delta) > 1) {
+          state.lastScrollDirection = delta < 0 ? 'up' : 'down';
+          state.lastUserScrollAt = currentTime;
+        } else {
+          state.lastScrollDirection = 'none';
+        }
+      }
+
+      state.lastScrollTop = currentScrollTop;
       onScrollChange();
     };
 
@@ -969,6 +1058,8 @@
       saveCfg();
       state.autoResolvedMode = 'soft';
       state.appliedMode = null;
+      state.lastUserScrollAt = 0;
+      state.lastScrollDirection = 'none';
       restoreAllForCurrentChat();
       scheduleMaintenance(0);
     });
@@ -982,6 +1073,8 @@
       saveCfg();
       state.autoResolvedMode = 'soft';
       state.appliedMode = null;
+      state.lastUserScrollAt = 0;
+      state.lastScrollDirection = 'none';
       restoreAllForCurrentChat();
       scheduleMaintenance(0);
     });
@@ -995,6 +1088,8 @@
       saveCfg();
       state.autoResolvedMode = 'soft';
       state.appliedMode = null;
+      state.lastUserScrollAt = 0;
+      state.lastScrollDirection = 'none';
       restoreAllForCurrentChat();
       scheduleMaintenance(0);
     });
@@ -1006,6 +1101,8 @@
       saveCfg();
       state.autoResolvedMode = 'soft';
       state.appliedMode = null;
+      state.lastUserScrollAt = 0;
+      state.lastScrollDirection = 'none';
       restoreAllForCurrentChat();
       setStatus('Все сообщения показаны. Антилаг выключен.');
       updateUI();
