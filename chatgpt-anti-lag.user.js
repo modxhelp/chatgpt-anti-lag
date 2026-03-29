@@ -2,7 +2,7 @@
 // @name         ChatGPT Anti-Lag
 // @name:ru      ChatGPT Anti-Lag — облегчение длинных чатов
 // @namespace    https://chatgpt.com/
-// @version      1.1.2
+// @version      1.2.0
 // @description  Makes long ChatGPT chats lighter by hiding or virtualizing old messages, with a compact control panel.
 // @description:ru  Уменьшает лаги в длинных чатах ChatGPT: скрывает или виртуализирует старые сообщения и даёт быстрое управление.
 // @author       Nikita + ChatGPT
@@ -15,7 +15,7 @@
 (function () {
   'use strict';
 
-  const LS_KEY = 'cg_anti_lag_cfg_v112';
+  const LS_KEY = 'cg_anti_lag_cfg_v120';
   const UI_ID = 'cg-anti-lag-root';
   const PRIMARY_ARTICLE_SELECTOR = 'article[data-testid^="conversation-turn-"]';
   const FALLBACK_ARTICLE_SELECTOR = '[data-message-author-role]';
@@ -23,14 +23,12 @@
 
   const defaults = {
     enabled: true,
-    mode: 'auto',
+    mode: 'soft',
     KEEP_OPEN: 4,
     MIN_KEEP: 1,
     MAX_KEEP: 25,
     SOFT_NEAR_BOTTOM_PX: 280,
     HARD_MARGIN_PX: 1800,
-    HARD_MODE_TOTAL_MESSAGES: 24,
-    HARD_MODE_HIDDEN_MESSAGES: 12,
     DEBOUNCE_MS: 120,
     MUTATION_DEBOUNCE_MS: 80,
     SCROLL_THROTTLE_MS: 50,
@@ -40,7 +38,6 @@
   };
 
   const MODE_LABELS = {
-    auto: 'Авто',
     soft: 'Мягкий',
     hard: 'Жёсткий',
   };
@@ -60,7 +57,6 @@
     lastUrl: location.href,
     currentChatKey: getChatKey(),
     statusText: 'Ожидание.',
-    autoResolvedMode: 'soft',
     appliedMode: null,
     softCollapsed: false,
     suppressScrollUntil: 0,
@@ -305,10 +301,6 @@
     #${UI_ID}[data-mode="hard"] .cg-chip {
       background: #b45309;
     }
-
-    #${UI_ID}[data-mode="auto"] .cg-chip {
-      background: #7c3aed;
-    }
   `;
 
   addStyle(css);
@@ -361,14 +353,12 @@
   function mergeDefaults(obj) {
     const out = { ...defaults, ...(obj || {}) };
     out.enabled = Boolean(out.enabled);
-    out.mode = ['auto', 'soft', 'hard'].includes(out.mode) ? out.mode : defaults.mode;
+    out.mode = ['soft', 'hard'].includes(out.mode) ? out.mode : defaults.mode;
     out.MIN_KEEP = Math.max(1, toInt(out.MIN_KEEP, defaults.MIN_KEEP));
     out.MAX_KEEP = Math.max(out.MIN_KEEP, toInt(out.MAX_KEEP, defaults.MAX_KEEP));
     out.KEEP_OPEN = clamp(toInt(out.KEEP_OPEN, defaults.KEEP_OPEN), out.MIN_KEEP, out.MAX_KEEP);
     out.SOFT_NEAR_BOTTOM_PX = Math.max(0, toInt(out.SOFT_NEAR_BOTTOM_PX, defaults.SOFT_NEAR_BOTTOM_PX));
     out.HARD_MARGIN_PX = Math.max(400, toInt(out.HARD_MARGIN_PX, defaults.HARD_MARGIN_PX));
-    out.HARD_MODE_TOTAL_MESSAGES = Math.max(10, toInt(out.HARD_MODE_TOTAL_MESSAGES, defaults.HARD_MODE_TOTAL_MESSAGES));
-    out.HARD_MODE_HIDDEN_MESSAGES = Math.max(4, toInt(out.HARD_MODE_HIDDEN_MESSAGES, defaults.HARD_MODE_HIDDEN_MESSAGES));
     out.DEBOUNCE_MS = Math.max(40, toInt(out.DEBOUNCE_MS, defaults.DEBOUNCE_MS));
     out.MUTATION_DEBOUNCE_MS = Math.max(20, toInt(out.MUTATION_DEBOUNCE_MS, defaults.MUTATION_DEBOUNCE_MS));
     out.SCROLL_THROTTLE_MS = Math.max(16, toInt(out.SCROLL_THROTTLE_MS, defaults.SCROLL_THROTTLE_MS));
@@ -452,11 +442,7 @@
 
   function getConversationNodes() {
     const selector = `${PRIMARY_ARTICLE_SELECTOR}, ${HARD_SPACER_SELECTOR}`;
-    const nodes = Array.from(document.querySelectorAll(selector)).filter((node) => {
-      if (!(node instanceof HTMLElement)) return false;
-      if (!node.dataset.cgVirtualId) return true;
-      return true;
-    });
+    const nodes = Array.from(document.querySelectorAll(selector)).filter((node) => node instanceof HTMLElement);
 
     if (nodes.length) return nodes;
 
@@ -479,17 +465,8 @@
     return Array.from(document.querySelectorAll(HARD_SPACER_SELECTOR));
   }
 
-  function getRenderedCount() {
-    return getRenderedArticles().filter((node) => node.dataset.cgSoftHidden !== '1').length;
-  }
-
-  function getTotalCount() {
-    const total = getConversationNodes().length;
-    return total;
-  }
-
   function refreshStats() {
-    const totalMessages = getTotalCount();
+    const totalMessages = getConversationNodes().length;
     const softHiddenMessages = getSoftHiddenNodes().length;
     const hardSpacerMessages = getHardSpacerNodes().length;
     const renderedMessages = Math.max(0, totalMessages - softHiddenMessages - hardSpacerMessages);
@@ -500,36 +477,6 @@
     state.stats.softHiddenMessages = softHiddenMessages;
     state.stats.hardSpacerMessages = hardSpacerMessages;
     state.stats.savedPercent = savedPercent;
-  }
-
-  function getCollapsibleCount(totalMessages) {
-    return Math.max(0, totalMessages - state.cfg.KEEP_OPEN);
-  }
-
-  function getEffectiveMode() {
-    if (state.cfg.mode !== 'auto') return state.cfg.mode;
-
-    refreshStats();
-
-    const totalMessages = state.stats.totalMessages;
-    const collapsibleCount = getCollapsibleCount(totalMessages);
-    const enterHard = (
-      totalMessages >= state.cfg.HARD_MODE_TOTAL_MESSAGES ||
-      collapsibleCount >= state.cfg.HARD_MODE_HIDDEN_MESSAGES
-    );
-
-    const leaveHardTotal = Math.max(state.cfg.KEEP_OPEN + 1, state.cfg.HARD_MODE_TOTAL_MESSAGES - 3);
-    const leaveHardCollapsible = Math.max(0, state.cfg.HARD_MODE_HIDDEN_MESSAGES - 2);
-
-    if (state.autoResolvedMode === 'hard') {
-      if (totalMessages <= leaveHardTotal && collapsibleCount <= leaveHardCollapsible) {
-        state.autoResolvedMode = 'soft';
-      }
-    } else {
-      state.autoResolvedMode = enterHard ? 'hard' : 'soft';
-    }
-
-    return state.autoResolvedMode;
   }
 
   function findScrollContainer() {
@@ -732,6 +679,7 @@
 
     state.softCollapsed = keepFromIndex > 0;
     refreshStats();
+
     if (state.stats.softHiddenMessages > 0) {
       setStatus(`Мягкий режим: скрыто ${state.stats.softHiddenMessages} старых сообщений.`);
     } else {
@@ -802,20 +750,20 @@
       return;
     }
 
-    const effectiveMode = getEffectiveMode();
+    const mode = state.cfg.mode;
 
-    if (state.appliedMode !== effectiveMode) {
+    if (state.appliedMode !== mode) {
       suppressScrollReactions(160);
-      if (effectiveMode === 'hard') {
+      if (mode === 'hard') {
         restoreSoft();
         state.softCollapsed = false;
       } else {
         restoreHard();
       }
-      state.appliedMode = effectiveMode;
+      state.appliedMode = mode;
     }
 
-    if (effectiveMode === 'hard') {
+    if (mode === 'hard') {
       applyHardMode();
     } else {
       applySoftMode();
@@ -839,7 +787,6 @@
     restoreAllForCurrentChat();
     state.articleMap.clear();
     state.nextVirtualId = 1;
-    state.autoResolvedMode = 'soft';
     state.appliedMode = null;
     state.lastScrollTop = 0;
     state.lastUserScrollAt = 0;
@@ -892,9 +839,11 @@
 
     state.scrollElement = container;
     state.cleanupScrollListener = setupScrollTracking(container, () => {
-      if (state.cfg.enabled && getEffectiveMode() === 'hard') {
+      if (!state.cfg.enabled) return;
+
+      if (state.cfg.mode === 'hard') {
         scheduleMaintenance(0);
-      } else if (state.cfg.enabled && getEffectiveMode() === 'soft' && !isNearBottom()) {
+      } else if (state.cfg.mode === 'soft' && !isNearBottom()) {
         scheduleMaintenance(0);
       }
     });
@@ -1007,7 +956,7 @@
 
           <div class="cg-row">
             <span class="cg-subtle">Режим</span>
-            <button class="cg-chip cg-mode" type="button">Авто</button>
+            <button class="cg-chip cg-mode" type="button">Мягкий</button>
           </div>
 
           <div class="cg-row">
@@ -1052,11 +1001,10 @@
     root.querySelector('.cg-mode').addEventListener('click', (event) => {
       event.preventDefault();
       event.stopPropagation();
-      const order = ['auto', 'soft', 'hard'];
+      const order = ['soft', 'hard'];
       const idx = order.indexOf(state.cfg.mode);
       state.cfg.mode = order[(idx + 1) % order.length];
       saveCfg();
-      state.autoResolvedMode = 'soft';
       state.appliedMode = null;
       state.lastUserScrollAt = 0;
       state.lastScrollDirection = 'none';
@@ -1071,7 +1019,6 @@
       if (next === state.cfg.KEEP_OPEN) return;
       state.cfg.KEEP_OPEN = next;
       saveCfg();
-      state.autoResolvedMode = 'soft';
       state.appliedMode = null;
       state.lastUserScrollAt = 0;
       state.lastScrollDirection = 'none';
@@ -1086,7 +1033,6 @@
       if (next === state.cfg.KEEP_OPEN) return;
       state.cfg.KEEP_OPEN = next;
       saveCfg();
-      state.autoResolvedMode = 'soft';
       state.appliedMode = null;
       state.lastUserScrollAt = 0;
       state.lastScrollDirection = 'none';
@@ -1099,7 +1045,6 @@
       event.stopPropagation();
       state.cfg.enabled = false;
       saveCfg();
-      state.autoResolvedMode = 'soft';
       state.appliedMode = null;
       state.lastUserScrollAt = 0;
       state.lastScrollDirection = 'none';
@@ -1143,7 +1088,6 @@
     if (!state.ui) return;
 
     refreshStats();
-    const effectiveMode = getEffectiveMode();
     const hiddenCount = state.stats.softHiddenMessages + state.stats.hardSpacerMessages;
 
     state.ui.root.setAttribute('data-enabled', state.cfg.enabled ? 'true' : 'false');
@@ -1155,9 +1099,7 @@
     state.ui.collapseBtn.textContent = state.cfg.panelCollapsed ? 'Развернуть' : 'Свернуть';
     state.ui.statusEl.textContent = state.statusText;
 
-    if (state.cfg.mode === 'auto') {
-      state.ui.modeBtn.title = `Автоматический режим. Сейчас выбран: ${getModeLabel(effectiveMode)}.`;
-    } else if (state.cfg.mode === 'soft') {
+    if (state.cfg.mode === 'soft') {
       state.ui.modeBtn.title = 'Мягкий режим: старые сообщения скрываются только у нижней границы чата.';
     } else {
       state.ui.modeBtn.title = 'Жёсткий режим: сообщения вне экрана заменяются spacers с сохранением высоты.';
@@ -1172,9 +1114,8 @@
     patchHistory();
     startObserver();
     attachOrUpdateScrollListener();
-    state.autoResolvedMode = 'soft';
     state.appliedMode = null;
-    setStatus(`Антилаг включён. Текущий режим: ${getModeLabel(getEffectiveMode())}.`);
+    setStatus(`Антилаг включён. Текущий режим: ${getModeLabel(state.cfg.mode)}.`);
     updateUI();
 
     state.fallbackTimer = window.setInterval(() => {
