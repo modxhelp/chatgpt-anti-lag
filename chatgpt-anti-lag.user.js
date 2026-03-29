@@ -1,44 +1,321 @@
- ==UserScript==
- @name         ChatGPT Anti-Lag — облегчение длинных чатов
- @nameru      ChatGPT Anti-Lag — облегчение длинных чатов
- @namespace    httpschatgpt.com
- @version      1.0.2
- @description  Makes long ChatGPT chats lighter by hiding or archiving old messages, with restore controls and a compact panel.
- @descriptionru  Уменьшает лаги в длинных чатах ChatGPT скрывает или архивирует старые сообщения, оставляя удобную панель управления и быстрое восстановление.
- @author       You
- @match        httpschatgpt.com
- @grant        GM_addStyle
- @run-at       document-idle
- ==UserScript==
+// ==UserScript==
+// @name         ChatGPT Anti-Lag
+// @name:ru      ChatGPT Anti-Lag — облегчение длинных чатов
+// @namespace    https://chatgpt.com/
+// @version      1.1.0
+// @description  Makes long ChatGPT chats lighter by hiding or virtualizing old messages, with a compact control panel.
+// @description:ru  Уменьшает лаги в длинных чатах ChatGPT: скрывает или виртуализирует старые сообщения и даёт быстрое управление.
+// @author       Nikita + ChatGPT
+// @match        https://chatgpt.com/*
+// @match        https://chat.openai.com/*
+// @grant        GM_addStyle
+// @run-at       document-idle
+// ==/UserScript==
 
 (function () {
   'use strict';
 
-  const LS_KEY = 'cg_anti_lag_cfg_v102_ru';
+  const LS_KEY = 'cg_anti_lag_cfg_v110';
+  const UI_ID = 'cg-anti-lag-root';
+  const PRIMARY_ARTICLE_SELECTOR = 'article[data-testid^="conversation-turn-"]';
+  const FALLBACK_ARTICLE_SELECTOR = '[data-message-author-role]';
+  const HARD_SPACER_SELECTOR = '[data-cg-hard-spacer="1"]';
 
   const defaults = {
-    enabled true,
-    mode 'auto',                auto  soft  hard
-    KEEP_OPEN 3,
-    MIN_KEEP 1,
-    MAX_KEEP 20,
-
-    DEBOUNCE_MS 220,
-    FALLBACK_TICK_MS 2500,
-    NEAR_BOTTOM_PX 260,
-
-    AUTO_HARD_TOTAL_MESSAGES 18,
-    AUTO_HARD_HIDDEN_MESSAGES 10,
-
-    HARD_ARCHIVE_LIMIT 120,     сколько недавних скрытых сообщений держать в hard-памяти
-    panelCollapsed false
+    enabled: true,
+    mode: 'auto',
+    KEEP_OPEN: 4,
+    MIN_KEEP: 1,
+    MAX_KEEP: 25,
+    SOFT_NEAR_BOTTOM_PX: 280,
+    HARD_MARGIN_PX: 1800,
+    HARD_MODE_TOTAL_MESSAGES: 24,
+    HARD_MODE_HIDDEN_MESSAGES: 12,
+    DEBOUNCE_MS: 120,
+    MUTATION_DEBOUNCE_MS: 80,
+    SCROLL_THROTTLE_MS: 50,
+    URL_CHECK_INTERVAL_MS: 1000,
+    FALLBACK_TICK_MS: 2500,
+    panelCollapsed: false,
   };
 
   const MODE_LABELS = {
-    auto 'Авто',
-    soft 'Мягкий',
-    hard 'Жёсткий'
+    auto: 'Авто',
+    soft: 'Мягкий',
+    hard: 'Жёсткий',
   };
+
+  const state = {
+    cfg: loadCfg(),
+    ui: null,
+    started: false,
+    historyPatched: false,
+    observer: null,
+    scrollElement: null,
+    cleanupScrollListener: null,
+    articleMap: new Map(),
+    nextVirtualId: 1,
+    maintenanceTimer: 0,
+    fallbackTimer: 0,
+    lastUrl: location.href,
+    currentChatKey: getChatKey(),
+    statusText: 'Ожидание.',
+    stats: {
+      totalMessages: 0,
+      renderedMessages: 0,
+      softHiddenMessages: 0,
+      hardSpacerMessages: 0,
+      savedPercent: 0,
+    },
+  };
+
+  const css = `
+    html, body {
+      scroll-behavior: auto !important;
+      overflow-anchor: none !important;
+    }
+
+    ${PRIMARY_ARTICLE_SELECTOR},
+    ${FALLBACK_ARTICLE_SELECTOR} {
+      content-visibility: auto;
+      contain: content;
+      contain-intrinsic-size: 700px 400px;
+    }
+
+    .cg-soft-hidden {
+      display: none !important;
+    }
+
+    .cg-hard-spacer {
+      display: block !important;
+      width: 100% !important;
+      min-height: 24px;
+      pointer-events: none !important;
+      opacity: 0 !important;
+      user-select: none !important;
+      contain: strict;
+    }
+
+    #${UI_ID} {
+      position: fixed;
+      right: 12px;
+      bottom: 16px;
+      z-index: 2147483647;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      font-size: 11px;
+      line-height: 1.25;
+      color: #f9fafb;
+      box-sizing: border-box;
+    }
+
+    #${UI_ID} *, #${UI_ID} *::before, #${UI_ID} *::after {
+      box-sizing: border-box;
+    }
+
+    #${UI_ID} .cg-pill {
+      display: flex;
+      align-items: flex-start;
+      gap: 8px;
+      padding: 8px;
+      border-radius: 16px;
+      background: rgba(17, 24, 39, 0.96);
+      box-shadow: 0 8px 24px rgba(0, 0, 0, 0.32);
+      min-width: 238px;
+      max-width: 270px;
+      user-select: none;
+      backdrop-filter: blur(8px);
+    }
+
+    #${UI_ID}.cg-collapsed .cg-pill {
+      min-width: auto;
+      max-width: none;
+      padding-right: 10px;
+      cursor: pointer;
+    }
+
+    #${UI_ID} .cg-lightning {
+      width: 22px;
+      height: 22px;
+      border-radius: 999px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: radial-gradient(circle at 30% 30%, #fde68a, #f97316);
+      box-shadow: 0 0 10px rgba(250, 204, 21, 0.55);
+      font-size: 14px;
+      flex: 0 0 auto;
+      margin-top: 2px;
+    }
+
+    #${UI_ID} .cg-panel {
+      display: flex;
+      flex-direction: column;
+      gap: 5px;
+      min-width: 176px;
+      width: 100%;
+    }
+
+    #${UI_ID}.cg-collapsed .cg-panel {
+      display: none;
+    }
+
+    #${UI_ID} .cg-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      min-height: 22px;
+    }
+
+    #${UI_ID} .cg-title {
+      font-weight: 700;
+      letter-spacing: 0.01em;
+    }
+
+    #${UI_ID} .cg-subtle {
+      opacity: 0.82;
+    }
+
+    #${UI_ID} .cg-btn,
+    #${UI_ID} .cg-chip,
+    #${UI_ID} .cg-step {
+      border: 0;
+      color: #f9fafb;
+      background: #374151;
+      border-radius: 999px;
+      cursor: pointer;
+      font: inherit;
+      transition: filter 0.14s ease-out, transform 0.14s ease-out;
+    }
+
+    #${UI_ID} .cg-btn:hover,
+    #${UI_ID} .cg-chip:hover,
+    #${UI_ID} .cg-step:hover {
+      filter: brightness(1.08);
+    }
+
+    #${UI_ID} .cg-btn:active,
+    #${UI_ID} .cg-chip:active,
+    #${UI_ID} .cg-step:active {
+      transform: translateY(1px);
+    }
+
+    #${UI_ID} .cg-btn {
+      padding: 4px 8px;
+      min-height: 24px;
+    }
+
+    #${UI_ID} .cg-chip {
+      padding: 4px 8px;
+      min-height: 24px;
+      min-width: 68px;
+      text-align: center;
+    }
+
+    #${UI_ID} .cg-keep-wrap {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+    }
+
+    #${UI_ID} .cg-step {
+      width: 22px;
+      height: 22px;
+      padding: 0;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      font-weight: 700;
+    }
+
+    #${UI_ID} .cg-keep-value,
+    #${UI_ID} .cg-hidden-value,
+    #${UI_ID} .cg-rendered-value {
+      min-width: 22px;
+      text-align: center;
+      font-weight: 700;
+    }
+
+    #${UI_ID} .cg-status {
+      font-size: 10px;
+      line-height: 1.3;
+      opacity: 0.86;
+      padding-top: 2px;
+      word-break: break-word;
+    }
+
+    #${UI_ID} .cg-actions {
+      display: flex;
+      gap: 6px;
+      justify-content: space-between;
+    }
+
+    #${UI_ID} .cg-actions .cg-btn {
+      flex: 1 1 auto;
+    }
+
+    #${UI_ID} .cg-switch {
+      position: relative;
+      width: 34px;
+      height: 18px;
+      border-radius: 999px;
+      border: 0;
+      padding: 2px;
+      background: #4b5563;
+      display: inline-flex;
+      align-items: center;
+      cursor: pointer;
+      transition: background 0.18s ease-out, box-shadow 0.18s ease-out;
+    }
+
+    #${UI_ID} .cg-switch-knob {
+      width: 14px;
+      height: 14px;
+      border-radius: 999px;
+      background: #f9fafb;
+      box-shadow: 0 1px 3px rgba(0, 0, 0, 0.4);
+      transform: translateX(0);
+      transition: transform 0.18s ease-out;
+    }
+
+    #${UI_ID}[data-enabled="true"] .cg-switch {
+      background: #22c55e;
+      box-shadow: 0 0 0 1px rgba(34, 197, 94, 0.35);
+    }
+
+    #${UI_ID}[data-enabled="true"] .cg-switch-knob {
+      transform: translateX(14px);
+    }
+
+    #${UI_ID}[data-enabled="false"] .cg-title {
+      opacity: 0.65;
+    }
+
+    #${UI_ID}[data-mode="soft"] .cg-chip {
+      background: #2563eb;
+    }
+
+    #${UI_ID}[data-mode="hard"] .cg-chip {
+      background: #b45309;
+    }
+
+    #${UI_ID}[data-mode="auto"] .cg-chip {
+      background: #7c3aed;
+    }
+  `;
+
+  addStyle(css);
+
+  function addStyle(text) {
+    try {
+      GM_addStyle(text);
+      return;
+    } catch (error) {}
+
+    const style = document.createElement('style');
+    style.textContent = text;
+    document.head.appendChild(style);
+  }
 
   function clamp(n, min, max) {
     return Math.min(max, Math.max(min, n));
@@ -46,29 +323,7 @@
 
   function toInt(value, fallback) {
     const n = Number(value);
-    return Number.isFinite(n)  Math.round(n)  fallback;
-  }
-
-  function mergeDefaults(obj) {
-    const out = { ...defaults, ...(obj  {}) };
-
-    out.enabled = Boolean(out.enabled);
-    out.mode = ['auto', 'soft', 'hard'].includes(out.mode)  out.mode  defaults.mode;
-    out.MIN_KEEP = Math.max(1, toInt(out.MIN_KEEP, defaults.MIN_KEEP));
-    out.MAX_KEEP = Math.max(out.MIN_KEEP, toInt(out.MAX_KEEP, defaults.MAX_KEEP));
-    out.KEEP_OPEN = clamp(toInt(out.KEEP_OPEN, defaults.KEEP_OPEN), out.MIN_KEEP, out.MAX_KEEP);
-
-    out.DEBOUNCE_MS = Math.max(50, toInt(out.DEBOUNCE_MS, defaults.DEBOUNCE_MS));
-    out.FALLBACK_TICK_MS = Math.max(800, toInt(out.FALLBACK_TICK_MS, defaults.FALLBACK_TICK_MS));
-    out.NEAR_BOTTOM_PX = Math.max(0, toInt(out.NEAR_BOTTOM_PX, defaults.NEAR_BOTTOM_PX));
-
-    out.AUTO_HARD_TOTAL_MESSAGES = Math.max(8, toInt(out.AUTO_HARD_TOTAL_MESSAGES, defaults.AUTO_HARD_TOTAL_MESSAGES));
-    out.AUTO_HARD_HIDDEN_MESSAGES = Math.max(4, toInt(out.AUTO_HARD_HIDDEN_MESSAGES, defaults.AUTO_HARD_HIDDEN_MESSAGES));
-    out.HARD_ARCHIVE_LIMIT = Math.max(20, toInt(out.HARD_ARCHIVE_LIMIT, defaults.HARD_ARCHIVE_LIMIT));
-
-    out.panelCollapsed = Boolean(out.panelCollapsed);
-
-    return out;
+    return Number.isFinite(n) ? Math.round(n) : fallback;
   }
 
   function loadCfg() {
@@ -76,480 +331,656 @@
       const raw = localStorage.getItem(LS_KEY);
       if (!raw) return mergeDefaults(null);
       return mergeDefaults(JSON.parse(raw));
-    } catch (e) {
+    } catch (error) {
       return mergeDefaults(null);
     }
   }
 
+  function mergeDefaults(obj) {
+    const out = { ...defaults, ...(obj || {}) };
+    out.enabled = Boolean(out.enabled);
+    out.mode = ['auto', 'soft', 'hard'].includes(out.mode) ? out.mode : defaults.mode;
+    out.MIN_KEEP = Math.max(1, toInt(out.MIN_KEEP, defaults.MIN_KEEP));
+    out.MAX_KEEP = Math.max(out.MIN_KEEP, toInt(out.MAX_KEEP, defaults.MAX_KEEP));
+    out.KEEP_OPEN = clamp(toInt(out.KEEP_OPEN, defaults.KEEP_OPEN), out.MIN_KEEP, out.MAX_KEEP);
+    out.SOFT_NEAR_BOTTOM_PX = Math.max(0, toInt(out.SOFT_NEAR_BOTTOM_PX, defaults.SOFT_NEAR_BOTTOM_PX));
+    out.HARD_MARGIN_PX = Math.max(400, toInt(out.HARD_MARGIN_PX, defaults.HARD_MARGIN_PX));
+    out.HARD_MODE_TOTAL_MESSAGES = Math.max(10, toInt(out.HARD_MODE_TOTAL_MESSAGES, defaults.HARD_MODE_TOTAL_MESSAGES));
+    out.HARD_MODE_HIDDEN_MESSAGES = Math.max(4, toInt(out.HARD_MODE_HIDDEN_MESSAGES, defaults.HARD_MODE_HIDDEN_MESSAGES));
+    out.DEBOUNCE_MS = Math.max(40, toInt(out.DEBOUNCE_MS, defaults.DEBOUNCE_MS));
+    out.MUTATION_DEBOUNCE_MS = Math.max(20, toInt(out.MUTATION_DEBOUNCE_MS, defaults.MUTATION_DEBOUNCE_MS));
+    out.SCROLL_THROTTLE_MS = Math.max(16, toInt(out.SCROLL_THROTTLE_MS, defaults.SCROLL_THROTTLE_MS));
+    out.URL_CHECK_INTERVAL_MS = Math.max(300, toInt(out.URL_CHECK_INTERVAL_MS, defaults.URL_CHECK_INTERVAL_MS));
+    out.FALLBACK_TICK_MS = Math.max(800, toInt(out.FALLBACK_TICK_MS, defaults.FALLBACK_TICK_MS));
+    out.panelCollapsed = Boolean(out.panelCollapsed);
+    return out;
+  }
+
   function saveCfg() {
     try {
-      localStorage.setItem(LS_KEY, JSON.stringify({
-        enabled cfg.enabled,
-        mode cfg.mode,
-        KEEP_OPEN cfg.KEEP_OPEN,
-        MIN_KEEP cfg.MIN_KEEP,
-        MAX_KEEP cfg.MAX_KEEP,
-        DEBOUNCE_MS cfg.DEBOUNCE_MS,
-        FALLBACK_TICK_MS cfg.FALLBACK_TICK_MS,
-        NEAR_BOTTOM_PX cfg.NEAR_BOTTOM_PX,
-        AUTO_HARD_TOTAL_MESSAGES cfg.AUTO_HARD_TOTAL_MESSAGES,
-        AUTO_HARD_HIDDEN_MESSAGES cfg.AUTO_HARD_HIDDEN_MESSAGES,
-        HARD_ARCHIVE_LIMIT cfg.HARD_ARCHIVE_LIMIT,
-        panelCollapsed cfg.panelCollapsed
-      }));
-    } catch (e) {}
-  }
-
-  const cfg = loadCfg();
-
-  const state = {
-    ui null,
-    observer null,
-    maintenanceTimer 0,
-    started false,
-    historyPatched false,
-    chatKey getChatKey(),
-    hardArchived [],
-    statusText 'Ожидание.'
-  };
-
-  const css = `
-    html, body {
-      scroll-behavior auto !important;
-      overflow-anchor none !important;
-    }
-
-    [data-message-author-role] {
-      content-visibility auto;
-      contain content;
-      contain-intrinsic-size 600px 400px;
-    }
-
-    .cg-soft-hidden {
-      display none !important;
-    }
-
-    .cg-archiver-btn {
-      position fixed;
-      right 12px;
-      bottom 16px;
-      z-index 2147483647;
-      font-family system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif;
-      font-size 11px;
-      line-height 1.25;
-      color #f9fafb;
-    }
-
-    .cg-archiver-btn  {
-      box-sizing border-box;
-    }
-
-    .cg-archiver-btn .cg-pill {
-      display flex;
-      align-items flex-start;
-      gap 8px;
-      padding 7px 8px;
-      border-radius 16px;
-      background rgba(17, 24, 39, 0.96);
-      box-shadow 0 4px 16px rgba(0, 0, 0, 0.35);
-      min-width 214px;
-      max-width 250px;
-      user-select none;
-    }
-
-    .cg-archiver-btn.cg-collapsed .cg-pill {
-      min-width auto;
-      max-width none;
-      padding-right 10px;
-      cursor pointer;
-    }
-
-    .cg-archiver-btn .cg-lightning {
-      width 22px;
-      height 22px;
-      border-radius 999px;
-      display flex;
-      align-items center;
-      justify-content center;
-      background radial-gradient(circle at 30% 30%, #fde68a, #f97316);
-      box-shadow 0 0 10px rgba(250, 204, 21, 0.6);
-      font-size 14px;
-      flex 0 0 auto;
-      margin-top 2px;
-    }
-
-    .cg-archiver-btn .cg-panel {
-      display flex;
-      flex-direction column;
-      gap 4px;
-      min-width 160px;
-      width 100%;
-    }
-
-    .cg-archiver-btn.cg-collapsed .cg-panel {
-      display none;
-    }
-
-    .cg-archiver-btn .cg-row {
-      display flex;
-      align-items center;
-      justify-content space-between;
-      gap 8px;
-      min-height 22px;
-    }
-
-    .cg-archiver-btn .cg-title {
-      font-weight 700;
-      letter-spacing 0.01em;
-    }
-
-    .cg-archiver-btn .cg-subtle {
-      opacity 0.82;
-    }
-
-    .cg-archiver-btn .cg-btn,
-    .cg-archiver-btn .cg-chip,
-    .cg-archiver-btn .cg-step {
-      border 0;
-      color #f9fafb;
-      background #374151;
-      border-radius 999px;
-      cursor pointer;
-      font inherit;
-    }
-
-    .cg-archiver-btn .cg-btnhover,
-    .cg-archiver-btn .cg-chiphover,
-    .cg-archiver-btn .cg-stephover {
-      filter brightness(1.08);
-    }
-
-    .cg-archiver-btn .cg-btn {
-      padding 4px 8px;
-      min-height 24px;
-    }
-
-    .cg-archiver-btn .cg-chip {
-      padding 4px 8px;
-      min-height 24px;
-      min-width 68px;
-      text-align center;
-    }
-
-    .cg-archiver-btn .cg-keep-wrap {
-      display inline-flex;
-      align-items center;
-      gap 4px;
-    }
-
-    .cg-archiver-btn .cg-step {
-      width 22px;
-      height 22px;
-      padding 0;
-      display inline-flex;
-      align-items center;
-      justify-content center;
-      font-weight 700;
-    }
-
-    .cg-archiver-btn .cg-keep-value,
-    .cg-archiver-btn .cg-hidden-value {
-      min-width 18px;
-      text-align center;
-      font-weight 700;
-    }
-
-    .cg-archiver-btn .cg-status {
-      font-size 10px;
-      line-height 1.25;
-      opacity 0.86;
-      padding-top 2px;
-      word-break break-word;
-    }
-
-    .cg-archiver-btn .cg-actions {
-      display flex;
-      gap 6px;
-      justify-content space-between;
-    }
-
-    .cg-archiver-btn .cg-actions .cg-btn {
-      flex 1 1 auto;
-    }
-
-    .cg-switch {
-      position relative;
-      width 34px;
-      height 18px;
-      border-radius 999px;
-      border 0;
-      padding 2px;
-      background #4b5563;
-      display inline-flex;
-      align-items center;
-      cursor pointer;
-      transition background 0.18s ease-out, box-shadow 0.18s ease-out;
-    }
-
-    .cg-switch-knob {
-      width 14px;
-      height 14px;
-      border-radius 999px;
-      background #f9fafb;
-      box-shadow 0 1px 3px rgba(0, 0, 0, 0.4);
-      transform translateX(0);
-      transition transform 0.18s ease-out;
-    }
-
-    .cg-archiver-btn[data-enabled=true] .cg-switch {
-      background #22c55e;
-      box-shadow 0 0 0 1px rgba(34, 197, 94, 0.35);
-    }
-
-    .cg-archiver-btn[data-enabled=true] .cg-switch-knob {
-      transform translateX(14px);
-    }
-
-    .cg-archiver-btn[data-enabled=false] .cg-title {
-      opacity 0.65;
-    }
-
-    .cg-archiver-btn[data-mode=soft] .cg-chip {
-      background #2563eb;
-    }
-
-    .cg-archiver-btn[data-mode=hard] .cg-chip {
-      background #b45309;
-    }
-
-    .cg-archiver-btn[data-mode=auto] .cg-chip {
-      background #7c3aed;
-    }
-  `;
-
-  try {
-    GM_addStyle(css);
-  } catch (e) {
-    const style = document.createElement('style');
-    style.textContent = css;
-    document.head.appendChild(style);
-  }
-
-  function $(sel, root) {
-    return (root  document).querySelector(sel);
-  }
-
-  function $all(sel, root) {
-    return Array.from((root  document).querySelectorAll(sel));
+      localStorage.setItem(LS_KEY, JSON.stringify(state.cfg));
+    } catch (error) {}
   }
 
   function getChatKey() {
-    return location.pathname  '';
-  }
-
-  function getScrollRoot() {
-    return document.scrollingElement  document.documentElement;
-  }
-
-  function nearBottom() {
-    const d = getScrollRoot();
-    const dist = (d.scrollHeight - d.clientHeight) - d.scrollTop;
-    return dist  cfg.NEAR_BOTTOM_PX;
+    return `${location.pathname}${location.search}`;
   }
 
   function getModeLabel(mode) {
-    return MODE_LABELS[mode]  mode;
+    return MODE_LABELS[mode] || mode;
   }
 
   function setStatus(text) {
-    state.statusText = text  'Ожидание.';
-    if (state.ui.statusEl) {
+    state.statusText = text || 'Ожидание.';
+    if (state.ui?.statusEl) {
       state.ui.statusEl.textContent = state.statusText;
     }
   }
 
-  function getAllMessageNodes() {
-    return $all('[data-message-author-role]').filter((node) = {
-      if (!node  !node.isConnected) return false;
-      if (state.ui.root && state.ui.root.contains(node)) return false;
+  function isStreaming() {
+    return Boolean(document.querySelector('[data-testid="stop-button"]'));
+  }
+
+  function getPrimaryArticles() {
+    const primary = Array.from(document.querySelectorAll(PRIMARY_ARTICLE_SELECTOR)).filter(isUsableMessageNode);
+    if (primary.length) return primary;
+
+    const fallback = Array.from(document.querySelectorAll(FALLBACK_ARTICLE_SELECTOR))
+      .map((node) => node.closest('article') || node)
+      .filter(isUsableMessageNode);
+
+    return uniqueNodes(fallback);
+  }
+
+  function uniqueNodes(nodes) {
+    const seen = new Set();
+    const result = [];
+
+    for (const node of nodes) {
+      if (!(node instanceof HTMLElement)) continue;
+      if (seen.has(node)) continue;
+      seen.add(node);
+      result.push(node);
+    }
+
+    return result;
+  }
+
+  function isUsableMessageNode(node) {
+    if (!(node instanceof HTMLElement)) return false;
+    if (!node.isConnected) return false;
+    if (node.closest(`#${UI_ID}`)) return false;
+    if (node.dataset.cgHardSpacer === '1') return false;
+    return true;
+  }
+
+  function ensureVirtualIdsForArticles(articles) {
+    for (const article of articles) {
+      if (!(article instanceof HTMLElement)) continue;
+
+      let id = article.dataset.cgVirtualId;
+      if (!id) {
+        id = String(state.nextVirtualId++);
+        article.dataset.cgVirtualId = id;
+      }
+
+      state.articleMap.set(id, article);
+    }
+  }
+
+  function getConversationNodes() {
+    const selector = `${PRIMARY_ARTICLE_SELECTOR}, ${HARD_SPACER_SELECTOR}`;
+    const nodes = Array.from(document.querySelectorAll(selector)).filter((node) => {
+      if (!(node instanceof HTMLElement)) return false;
+      if (!node.dataset.cgVirtualId) return true;
       return true;
+    });
+
+    if (nodes.length) return nodes;
+
+    return Array.from(document.querySelectorAll(`${FALLBACK_ARTICLE_SELECTOR}, ${HARD_SPACER_SELECTOR}`)).filter((node) => {
+      if (!(node instanceof HTMLElement)) return false;
+      if (node.matches(HARD_SPACER_SELECTOR)) return true;
+      return !node.closest('article') || node.closest('article') === node;
     });
   }
 
-  function getActiveMessageNodes() {
-    return getAllMessageNodes().filter((node) = {
-      if (node.dataset.cgSoftHidden === '1') return false;
-      if (node.dataset.cgHardArchived === '1') return false;
-      return true;
-    });
+  function getRenderedArticles() {
+    return getPrimaryArticles();
   }
 
   function getSoftHiddenNodes() {
-    return $all('[data-cg-soft-hidden=1]');
+    return Array.from(document.querySelectorAll('[data-cg-soft-hidden="1"]'));
   }
 
-  function getSoftHiddenCount() {
-    return getSoftHiddenNodes().length;
+  function getHardSpacerNodes() {
+    return Array.from(document.querySelectorAll(HARD_SPACER_SELECTOR));
   }
 
-  function getHardArchivedItems(chatKey) {
-    const key = chatKey  state.chatKey;
-    return state.hardArchived.filter((item) = item && item.chatKey === key);
+  function getRenderedCount() {
+    return getRenderedArticles().filter((node) => node.dataset.cgSoftHidden !== '1').length;
   }
 
-  function getHardHiddenCount() {
-    return getHardArchivedItems(state.chatKey).length;
+  function getTotalCount() {
+    const total = getConversationNodes().length;
+    return total;
+  }
+
+  function refreshStats() {
+    const totalMessages = getTotalCount();
+    const softHiddenMessages = getSoftHiddenNodes().length;
+    const hardSpacerMessages = getHardSpacerNodes().length;
+    const renderedMessages = Math.max(0, totalMessages - softHiddenMessages - hardSpacerMessages);
+    const savedPercent = totalMessages > 0 ? Math.round(((softHiddenMessages + hardSpacerMessages) / totalMessages) * 100) : 0;
+
+    state.stats.totalMessages = totalMessages;
+    state.stats.renderedMessages = renderedMessages;
+    state.stats.softHiddenMessages = softHiddenMessages;
+    state.stats.hardSpacerMessages = hardSpacerMessages;
+    state.stats.savedPercent = savedPercent;
   }
 
   function getEffectiveMode() {
-    if (cfg.mode !== 'auto') return cfg.mode;
+    if (state.cfg.mode !== 'auto') return state.cfg.mode;
 
-    const total = getAllMessageNodes().length + getHardHiddenCount();
-    const hiddenSoft = getSoftHiddenCount();
+    refreshStats();
 
-    if (total = cfg.AUTO_HARD_TOTAL_MESSAGES) return 'hard';
-    if (hiddenSoft = cfg.AUTO_HARD_HIDDEN_MESSAGES) return 'hard';
-
+    if (state.stats.totalMessages >= state.cfg.HARD_MODE_TOTAL_MESSAGES) return 'hard';
+    if ((state.stats.softHiddenMessages + state.stats.hardSpacerMessages) >= state.cfg.HARD_MODE_HIDDEN_MESSAGES) return 'hard';
     return 'soft';
   }
 
-  function getHiddenCountForMode(mode) {
-    if (mode === 'hard') {
-      return getHardHiddenCount() + getSoftHiddenCount();
+  function findScrollContainer() {
+    if (state.scrollElement && state.scrollElement instanceof HTMLElement && state.scrollElement.isConnected) {
+      return state.scrollElement;
     }
-    return getSoftHiddenCount();
+
+    const firstMessage = document.querySelector(PRIMARY_ARTICLE_SELECTOR) || document.querySelector(FALLBACK_ARTICLE_SELECTOR);
+
+    if (firstMessage instanceof HTMLElement) {
+      let ancestor = firstMessage.parentElement;
+      while (ancestor && ancestor !== document.body && ancestor !== document.documentElement) {
+        const styles = window.getComputedStyle(ancestor);
+        const overflowY = styles.overflowY;
+        const isScrollable = (overflowY === 'auto' || overflowY === 'scroll') && ancestor.scrollHeight > ancestor.clientHeight + 8;
+        if (isScrollable) return ancestor;
+        ancestor = ancestor.parentElement;
+      }
+    }
+
+    return document.scrollingElement || document.documentElement || document.body;
+  }
+
+  function getViewportMetrics() {
+    const scrollElement = findScrollContainer();
+
+    if (
+      scrollElement instanceof HTMLElement &&
+      scrollElement !== document.body &&
+      scrollElement !== document.documentElement
+    ) {
+      const rect = scrollElement.getBoundingClientRect();
+      return {
+        top: rect.top,
+        height: scrollElement.clientHeight,
+      };
+    }
+
+    return {
+      top: 0,
+      height: window.innerHeight,
+    };
+  }
+
+  function isNearBottom() {
+    const scrollElement = findScrollContainer();
+
+    if (
+      scrollElement instanceof HTMLElement &&
+      scrollElement !== document.body &&
+      scrollElement !== document.documentElement
+    ) {
+      const dist = (scrollElement.scrollHeight - scrollElement.clientHeight) - scrollElement.scrollTop;
+      return dist <= state.cfg.SOFT_NEAR_BOTTOM_PX;
+    }
+
+    const root = document.scrollingElement || document.documentElement;
+    const dist = (root.scrollHeight - root.clientHeight) - root.scrollTop;
+    return dist <= state.cfg.SOFT_NEAR_BOTTOM_PX;
+  }
+
+  function markSoftHidden(node) {
+    if (!(node instanceof HTMLElement)) return;
+    if (node.dataset.cgSoftHidden === '1') return;
+    node.dataset.cgSoftHidden = '1';
+    node.classList.add('cg-soft-hidden');
+    node.setAttribute('aria-hidden', 'true');
+  }
+
+  function unmarkSoftHidden(node) {
+    if (!(node instanceof HTMLElement)) return;
+    delete node.dataset.cgSoftHidden;
+    node.classList.remove('cg-soft-hidden');
+    node.removeAttribute('aria-hidden');
+  }
+
+  function restoreSoft() {
+    for (const node of getSoftHiddenNodes()) {
+      unmarkSoftHidden(node);
+    }
+  }
+
+  function convertArticleToSpacer(article) {
+    if (!(article instanceof HTMLElement) || !article.isConnected) return false;
+
+    const id = article.dataset.cgVirtualId;
+    if (!id) return false;
+
+    const rect = article.getBoundingClientRect();
+    const height = Math.max(24, Math.round(rect.height || article.offsetHeight || 24));
+
+    const spacer = document.createElement('div');
+    spacer.className = 'cg-hard-spacer';
+    spacer.dataset.cgHardSpacer = '1';
+    spacer.dataset.cgVirtualId = id;
+    spacer.dataset.cgChatKey = state.currentChatKey;
+    spacer.style.height = `${height}px`;
+
+    state.articleMap.set(id, article);
+    article.replaceWith(spacer);
+    return true;
+  }
+
+  function convertSpacerToArticle(spacer) {
+    if (!(spacer instanceof HTMLElement) || !spacer.isConnected) return false;
+
+    const id = spacer.dataset.cgVirtualId;
+    if (!id) return false;
+
+    const original = state.articleMap.get(id);
+    if (!(original instanceof HTMLElement)) return false;
+    if (original.isConnected) return false;
+
+    spacer.replaceWith(original);
+    return true;
+  }
+
+  function restoreHard() {
+    const spacers = getHardSpacerNodes();
+    for (const spacer of spacers) {
+      convertSpacerToArticle(spacer);
+    }
+  }
+
+  function restoreAllForCurrentChat() {
+    restoreHard();
+    restoreSoft();
+    refreshStats();
+    updateUI();
+  }
+
+  function getTailProtectedIds(nodes) {
+    const ids = [];
+    for (const node of nodes) {
+      if (!(node instanceof HTMLElement)) continue;
+      const id = node.dataset.cgVirtualId;
+      if (!id) continue;
+      ids.push(id);
+    }
+
+    return new Set(ids.slice(-state.cfg.KEEP_OPEN));
+  }
+
+  function applySoftMode() {
+    restoreHard();
+    const articles = getRenderedArticles();
+    ensureVirtualIdsForArticles(articles);
+
+    if (!isNearBottom()) {
+      restoreSoft();
+      refreshStats();
+      setStatus('Мягкий режим: прокрутка не внизу, старые сообщения временно показаны.');
+      return;
+    }
+
+    restoreSoft();
+
+    const hideLimit = Math.max(0, articles.length - state.cfg.KEEP_OPEN);
+    for (let i = 0; i < hideLimit; i += 1) {
+      markSoftHidden(articles[i]);
+    }
+
+    refreshStats();
+    if (state.stats.softHiddenMessages > 0) {
+      setStatus(`Мягкий режим: скрыто ${state.stats.softHiddenMessages} старых сообщений.`);
+    } else {
+      setStatus('Мягкий режим: скрывать пока нечего.');
+    }
+  }
+
+  function applyHardMode() {
+    restoreSoft();
+
+    if (isStreaming()) {
+      refreshStats();
+      setStatus('Жёсткий режим: ответ ещё генерируется, виртуализация ждёт.');
+      return;
+    }
+
+    const articles = getRenderedArticles();
+    ensureVirtualIdsForArticles(articles);
+
+    const nodes = getConversationNodes();
+    const keepTailIds = getTailProtectedIds(nodes);
+    const viewport = getViewportMetrics();
+
+    for (const node of nodes) {
+      if (!(node instanceof HTMLElement)) continue;
+
+      const id = node.dataset.cgVirtualId;
+      const isTailProtected = id ? keepTailIds.has(id) : false;
+      const rect = node.getBoundingClientRect();
+      const relativeTop = rect.top - viewport.top;
+      const relativeBottom = rect.bottom - viewport.top;
+      const isOutside = relativeBottom < -state.cfg.HARD_MARGIN_PX || relativeTop > viewport.height + state.cfg.HARD_MARGIN_PX;
+
+      if (node.matches(HARD_SPACER_SELECTOR)) {
+        if (!isOutside || isTailProtected) {
+          convertSpacerToArticle(node);
+        }
+        continue;
+      }
+
+      if (isTailProtected) continue;
+      if (isOutside) {
+        convertArticleToSpacer(node);
+      }
+    }
+
+    refreshStats();
+
+    if (state.stats.hardSpacerMessages > 0) {
+      setStatus(`Жёсткий режим: виртуализировано ${state.stats.hardSpacerMessages} сообщений.`);
+    } else {
+      setStatus('Жёсткий режим: пока всё рядом с экраном.');
+    }
+  }
+
+  function runMaintenance() {
+    ensureUI();
+    handleRouteChange();
+    attachOrUpdateScrollListener();
+
+    if (!state.cfg.enabled) {
+      restoreAllForCurrentChat();
+      setStatus('Антилаг выключен.');
+      updateUI();
+      return;
+    }
+
+    const effectiveMode = getEffectiveMode();
+
+    if (effectiveMode === 'hard') {
+      applyHardMode();
+    } else {
+      applySoftMode();
+    }
+
+    refreshStats();
+    updateUI();
+  }
+
+  function scheduleMaintenance(delay) {
+    window.clearTimeout(state.maintenanceTimer);
+    state.maintenanceTimer = window.setTimeout(runMaintenance, typeof delay === 'number' ? delay : state.cfg.DEBOUNCE_MS);
+  }
+
+  function handleRouteChange() {
+    const currentUrl = location.href;
+    const currentChatKey = getChatKey();
+
+    if (currentUrl === state.lastUrl && currentChatKey === state.currentChatKey) return;
+
+    restoreAllForCurrentChat();
+    state.articleMap.clear();
+    state.nextVirtualId = 1;
+    state.lastUrl = currentUrl;
+    state.currentChatKey = currentChatKey;
+    setStatus('Открыт другой чат.');
+  }
+
+  function patchHistory() {
+    if (state.historyPatched) return;
+    state.historyPatched = true;
+
+    const fire = () => window.setTimeout(() => scheduleMaintenance(0), 0);
+
+    const origPushState = history.pushState;
+    history.pushState = function pushStatePatched() {
+      const result = origPushState.apply(this, arguments);
+      fire();
+      return result;
+    };
+
+    const origReplaceState = history.replaceState;
+    history.replaceState = function replaceStatePatched() {
+      const result = origReplaceState.apply(this, arguments);
+      fire();
+      return result;
+    };
+
+    window.addEventListener('popstate', fire, true);
+    window.setInterval(() => {
+      if (location.href !== state.lastUrl) {
+        fire();
+      }
+    }, state.cfg.URL_CHECK_INTERVAL_MS);
+  }
+
+  function attachOrUpdateScrollListener() {
+    const container = findScrollContainer();
+    if (!container) return;
+
+    if (container === state.scrollElement && state.cleanupScrollListener) {
+      return;
+    }
+
+    if (state.cleanupScrollListener) {
+      state.cleanupScrollListener();
+      state.cleanupScrollListener = null;
+    }
+
+    state.scrollElement = container;
+    state.cleanupScrollListener = setupScrollTracking(container, () => {
+      if (state.cfg.enabled && getEffectiveMode() === 'hard') {
+        scheduleMaintenance(0);
+      } else if (state.cfg.enabled && getEffectiveMode() === 'soft' && !isNearBottom()) {
+        scheduleMaintenance(0);
+      }
+    });
+  }
+
+  function setupScrollTracking(scrollContainer, onScrollChange) {
+    let lastCheckTime = 0;
+    let frameId = null;
+
+    const now = typeof performance !== 'undefined' && typeof performance.now === 'function'
+      ? () => performance.now()
+      : () => Date.now();
+
+    const runCheck = () => {
+      const currentTime = now();
+      if (currentTime - lastCheckTime < state.cfg.SCROLL_THROTTLE_MS) return;
+      lastCheckTime = currentTime;
+      onScrollChange();
+    };
+
+    const handleScroll = () => {
+      if (frameId !== null) return;
+      frameId = requestAnimationFrame(() => {
+        frameId = null;
+        runCheck();
+      });
+    };
+
+    scrollContainer.addEventListener('scroll', handleScroll, { passive: true });
+
+    return () => {
+      scrollContainer.removeEventListener('scroll', handleScroll);
+      if (frameId !== null) {
+        cancelAnimationFrame(frameId);
+      }
+    };
+  }
+
+  function startObserver() {
+    if (state.observer || !document.body) return;
+
+    const onMutation = debounce(() => {
+      attachOrUpdateScrollListener();
+      scheduleMaintenance(0);
+    }, state.cfg.MUTATION_DEBOUNCE_MS);
+
+    state.observer = new MutationObserver((mutations) => {
+      for (const mutation of mutations) {
+        if (state.ui?.root && state.ui.root.contains(mutation.target)) continue;
+        onMutation();
+        break;
+      }
+    });
+
+    state.observer.observe(document.body, {
+      childList: true,
+      subtree: true,
+    });
+  }
+
+  function debounce(fn, wait) {
+    let timer = 0;
+    return function debounced() {
+      window.clearTimeout(timer);
+      timer = window.setTimeout(() => fn.apply(this, arguments), wait);
+    };
   }
 
   function ensureUI() {
-    if (state.ui.root.isConnected) return;
+    if (state.ui?.root?.isConnected) return;
 
     const root = document.createElement('div');
-    root.className = 'cg-archiver-btn';
-    if (cfg.panelCollapsed) root.classList.add('cg-collapsed');
+    root.id = UI_ID;
+    if (state.cfg.panelCollapsed) root.classList.add('cg-collapsed');
 
     root.innerHTML = `
-      div class=cg-pill
-        div class=cg-lightning title=ChatGPT Anti-Lag⚡div
+      <div class="cg-pill">
+        <div class="cg-lightning" title="ChatGPT Anti-Lag">⚡</div>
+        <div class="cg-panel">
+          <div class="cg-row">
+            <span class="cg-title">Антилаг</span>
+            <button class="cg-switch" type="button" aria-label="Включить или выключить Anti-Lag">
+              <span class="cg-switch-knob"></span>
+            </button>
+          </div>
 
-        div class=cg-panel
-          div class=cg-row
-            span class=cg-titleАнтилагspan
-            button class=cg-switch type=button aria-label=Включить или выключить Anti-Lag
-              span class=cg-switch-knobspan
-            button
-          div
+          <div class="cg-row">
+            <span class="cg-subtle">Режим</span>
+            <button class="cg-chip cg-mode" type="button">Авто</button>
+          </div>
 
-          div class=cg-row
-            span class=cg-subtleРежимspan
-            button class=cg-chip cg-mode type=buttonАвтоbutton
-          div
+          <div class="cg-row">
+            <span class="cg-subtle">Оставлять</span>
+            <span class="cg-keep-wrap">
+              <button class="cg-step cg-dec" type="button" aria-label="Уменьшить количество">−</button>
+              <span class="cg-keep-value">4</span>
+              <button class="cg-step cg-inc" type="button" aria-label="Увеличить количество">+</button>
+            </span>
+          </div>
 
-          div class=cg-row
-            span class=cg-subtleОставлятьspan
-            span class=cg-keep-wrap
-              button class=cg-step cg-dec type=button aria-label=Уменьшить количество−button
-              span class=cg-keep-value3span
-              button class=cg-step cg-inc type=button aria-label=Увеличить количество+button
-            span
-          div
+          <div class="cg-row">
+            <span class="cg-subtle">Скрыто</span>
+            <span class="cg-hidden-value">0</span>
+          </div>
 
-          div class=cg-row
-            span class=cg-subtleСкрытоspan
-            span class=cg-hidden-value0span
-          div
+          <div class="cg-row">
+            <span class="cg-subtle">Рендер</span>
+            <span class="cg-rendered-value">0</span>
+          </div>
 
-          div class=cg-statusОжидание.div
+          <div class="cg-status">Ожидание.</div>
 
-          div class=cg-actions
-            button class=cg-btn cg-restore type=buttonПоказать всёbutton
-            button class=cg-btn cg-collapse type=buttonСвернутьbutton
-          div
-        div
-      div
+          <div class="cg-actions">
+            <button class="cg-btn cg-restore" type="button">Показать всё</button>
+            <button class="cg-btn cg-collapse" type="button">Свернуть</button>
+          </div>
+        </div>
+      </div>
     `;
 
     document.documentElement.appendChild(root);
 
-    root.querySelector('.cg-switch').addEventListener('click', function (ev) {
-      ev.preventDefault();
-      ev.stopPropagation();
-      cfg.enabled = !cfg.enabled;
+    root.querySelector('.cg-switch').addEventListener('click', (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      state.cfg.enabled = !state.cfg.enabled;
       saveCfg();
-      applyEnabled();
+      scheduleMaintenance(0);
     });
 
-    root.querySelector('.cg-mode').addEventListener('click', function (ev) {
-      ev.preventDefault();
-      ev.stopPropagation();
-
+    root.querySelector('.cg-mode').addEventListener('click', (event) => {
+      event.preventDefault();
+      event.stopPropagation();
       const order = ['auto', 'soft', 'hard'];
-      const idx = order.indexOf(cfg.mode);
-      cfg.mode = order[(idx + 1) % order.length];
-
+      const idx = order.indexOf(state.cfg.mode);
+      state.cfg.mode = order[(idx + 1) % order.length];
       saveCfg();
-      restoreCurrentChat();
-      updateUI();
-
-      if (cfg.enabled) scheduleMaintenance();
+      restoreAllForCurrentChat();
+      scheduleMaintenance(0);
     });
 
-    root.querySelector('.cg-dec').addEventListener('click', function (ev) {
-      ev.preventDefault();
-      ev.stopPropagation();
-
-      const next = clamp(cfg.KEEP_OPEN - 1, cfg.MIN_KEEP, cfg.MAX_KEEP);
-      if (next === cfg.KEEP_OPEN) return;
-
-      cfg.KEEP_OPEN = next;
+    root.querySelector('.cg-dec').addEventListener('click', (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      const next = clamp(state.cfg.KEEP_OPEN - 1, state.cfg.MIN_KEEP, state.cfg.MAX_KEEP);
+      if (next === state.cfg.KEEP_OPEN) return;
+      state.cfg.KEEP_OPEN = next;
       saveCfg();
-      restoreCurrentChat();
-      updateUI();
-
-      if (cfg.enabled) scheduleMaintenance();
+      restoreAllForCurrentChat();
+      scheduleMaintenance(0);
     });
 
-    root.querySelector('.cg-inc').addEventListener('click', function (ev) {
-      ev.preventDefault();
-      ev.stopPropagation();
-
-      const next = clamp(cfg.KEEP_OPEN + 1, cfg.MIN_KEEP, cfg.MAX_KEEP);
-      if (next === cfg.KEEP_OPEN) return;
-
-      cfg.KEEP_OPEN = next;
+    root.querySelector('.cg-inc').addEventListener('click', (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      const next = clamp(state.cfg.KEEP_OPEN + 1, state.cfg.MIN_KEEP, state.cfg.MAX_KEEP);
+      if (next === state.cfg.KEEP_OPEN) return;
+      state.cfg.KEEP_OPEN = next;
       saveCfg();
-      restoreCurrentChat();
-      updateUI();
-
-      if (cfg.enabled) scheduleMaintenance();
+      restoreAllForCurrentChat();
+      scheduleMaintenance(0);
     });
 
-    root.querySelector('.cg-restore').addEventListener('click', function (ev) {
-      ev.preventDefault();
-      ev.stopPropagation();
-
-      cfg.enabled = false;
+    root.querySelector('.cg-restore').addEventListener('click', (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      state.cfg.enabled = false;
       saveCfg();
-      restoreCurrentChat();
-      applyEnabled();
+      restoreAllForCurrentChat();
       setStatus('Все сообщения показаны. Антилаг выключен.');
-    });
-
-    root.querySelector('.cg-collapse').addEventListener('click', function (ev) {
-      ev.preventDefault();
-      ev.stopPropagation();
-
-      cfg.panelCollapsed = !cfg.panelCollapsed;
-      saveCfg();
-
-      root.classList.toggle('cg-collapsed', cfg.panelCollapsed);
       updateUI();
     });
 
-    root.querySelector('.cg-pill').addEventListener('click', function (ev) {
-      if (!cfg.panelCollapsed) return;
-      if (ev.target.closest('button')) return;
+    root.querySelector('.cg-collapse').addEventListener('click', (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      state.cfg.panelCollapsed = !state.cfg.panelCollapsed;
+      saveCfg();
+      root.classList.toggle('cg-collapsed', state.cfg.panelCollapsed);
+      updateUI();
+    });
 
-      cfg.panelCollapsed = false;
+    root.querySelector('.cg-pill').addEventListener('click', (event) => {
+      if (!state.cfg.panelCollapsed) return;
+      if (event.target.closest('button')) return;
+      state.cfg.panelCollapsed = false;
       saveCfg();
       root.classList.remove('cg-collapsed');
       updateUI();
@@ -557,11 +988,12 @@
 
     state.ui = {
       root,
-      modeBtn root.querySelector('.cg-mode'),
-      keepValue root.querySelector('.cg-keep-value'),
-      hiddenValue root.querySelector('.cg-hidden-value'),
-      statusEl root.querySelector('.cg-status'),
-      collapseBtn root.querySelector('.cg-collapse')
+      modeBtn: root.querySelector('.cg-mode'),
+      keepValue: root.querySelector('.cg-keep-value'),
+      hiddenValue: root.querySelector('.cg-hidden-value'),
+      renderedValue: root.querySelector('.cg-rendered-value'),
+      statusEl: root.querySelector('.cg-status'),
+      collapseBtn: root.querySelector('.cg-collapse'),
     };
 
     updateUI();
@@ -570,298 +1002,26 @@
   function updateUI() {
     if (!state.ui) return;
 
+    refreshStats();
     const effectiveMode = getEffectiveMode();
-    const hiddenCount = getHiddenCountForMode(effectiveMode);
+    const hiddenCount = state.stats.softHiddenMessages + state.stats.hardSpacerMessages;
 
-    state.ui.root.setAttribute('data-enabled', cfg.enabled  'true'  'false');
-    state.ui.root.setAttribute('data-mode', cfg.mode);
-
-    state.ui.modeBtn.textContent = getModeLabel(cfg.mode);
-
-    if (cfg.mode === 'auto') {
-      state.ui.modeBtn.title = `Автоматический режим. Сейчас выбран ${getModeLabel(effectiveMode)}.`;
-    } else if (cfg.mode === 'soft') {
-      state.ui.modeBtn.title = 'Мягкий режим старые сообщения просто скрываются.';
-    } else {
-      state.ui.modeBtn.title = 'Жёсткий режим недавние старые сообщения архивируются, а самые старые переводятся в мягтое скрытие.';
-    }
-
-    state.ui.keepValue.textContent = String(cfg.KEEP_OPEN);
+    state.ui.root.setAttribute('data-enabled', state.cfg.enabled ? 'true' : 'false');
+    state.ui.root.setAttribute('data-mode', state.cfg.mode);
+    state.ui.modeBtn.textContent = getModeLabel(state.cfg.mode);
+    state.ui.keepValue.textContent = String(state.cfg.KEEP_OPEN);
     state.ui.hiddenValue.textContent = String(hiddenCount);
-    state.ui.collapseBtn.textContent = cfg.panelCollapsed  'Развернуть'  'Свернуть';
+    state.ui.renderedValue.textContent = String(state.stats.renderedMessages);
+    state.ui.collapseBtn.textContent = state.cfg.panelCollapsed ? 'Развернуть' : 'Свернуть';
     state.ui.statusEl.textContent = state.statusText;
-  }
 
-  function markSoftHidden(node) {
-    if (!node) return;
-    node.dataset.cgSoftHidden = '1';
-    node.classList.add('cg-soft-hidden');
-    node.setAttribute('aria-hidden', 'true');
-  }
-
-  function unmarkSoftHidden(node) {
-    if (!node) return;
-    node.dataset.cgSoftHidden = '';
-    node.removeAttribute('data-cg-soft-hidden');
-    node.classList.remove('cg-soft-hidden');
-    node.removeAttribute('aria-hidden');
-  }
-
-  function restoreSoft() {
-    const nodes = getSoftHiddenNodes();
-    for (const node of nodes) {
-      unmarkSoftHidden(node);
-    }
-  }
-
-  function archiveSoft() {
-    const nodes = getActiveMessageNodes();
-    const limit = nodes.length - cfg.KEEP_OPEN;
-    if (limit = 0) return 0;
-
-    let count = 0;
-    for (let i = 0; i  limit; i++) {
-      const node = nodes[i];
-      if (!node) continue;
-      markSoftHidden(node);
-      count++;
-    }
-
-    return count;
-  }
-
-  function hardArchiveNode(node) {
-    if (!node  !node.parentNode) return false;
-
-    const placeholder = document.createElement('span');
-    placeholder.hidden = true;
-    placeholder.style.display = 'none';
-    placeholder.dataset.cgPlaceholder = '1';
-    placeholder.dataset.cgChatKey = state.chatKey;
-
-    try {
-      node.dataset.cgHardArchived = '1';
-      node.parentNode.replaceChild(placeholder, node);
-
-      state.hardArchived.push({
-        node,
-        placeholder,
-        chatKey state.chatKey
-      });
-
-      return true;
-    } catch (e) {
-      node.removeAttribute('data-cg-hard-archived');
-      return false;
-    }
-  }
-
-  function archiveHard() {
-    const nodes = getActiveMessageNodes();
-    const limit = nodes.length - cfg.KEEP_OPEN;
-    if (limit = 0) return 0;
-
-    let count = 0;
-    for (let i = 0; i  limit; i++) {
-      const node = nodes[i];
-      if (hardArchiveNode(node)) count++;
-    }
-
-    softenOldHardArchived(state.chatKey);
-    return count;
-  }
-
-  function restoreHard(chatKey) {
-    const survivors = [];
-
-    for (const item of state.hardArchived) {
-      if (!item) continue;
-
-      if (item.chatKey !== chatKey) {
-        survivors.push(item);
-        continue;
-      }
-
-      try {
-        if (item.placeholder && item.placeholder.parentNode) {
-          item.placeholder.parentNode.replaceChild(item.node, item.placeholder);
-        }
-      } catch (e) {}
-
-      if (item.node.removeAttribute) {
-        item.node.removeAttribute('data-cg-hard-archived');
-      }
-    }
-
-    state.hardArchived = survivors;
-  }
-
-  function softenOldHardArchived(chatKey) {
-    const currentItems = [];
-    const otherItems = [];
-
-    for (const item of state.hardArchived) {
-      if (!item) continue;
-      if (item.chatKey === chatKey) currentItems.push(item);
-      else otherItems.push(item);
-    }
-
-    if (currentItems.length = cfg.HARD_ARCHIVE_LIMIT) {
-      state.hardArchived = [...otherItems, ...currentItems];
-      return 0;
-    }
-
-    const excess = currentItems.length - cfg.HARD_ARCHIVE_LIMIT;
-    const toSoften = currentItems.slice(0, excess);
-    const toKeepHard = currentItems.slice(excess);
-
-    let softened = 0;
-
-    for (const item of toSoften) {
-      try {
-        if (item.placeholder && item.placeholder.parentNode) {
-          item.placeholder.parentNode.replaceChild(item.node, item.placeholder);
-          item.node.removeAttribute('data-cg-hard-archived');
-          markSoftHidden(item.node);
-          softened++;
-        }
-      } catch (e) {}
-    }
-
-    state.hardArchived = [...otherItems, ...toKeepHard];
-
-    if (softened  0) {
-      setStatus(`Жёсткий кэш переполнен ${softened} старых сообщений переведено в мягкое скрытие.`);
-    }
-
-    return softened;
-  }
-
-  function restoreCurrentChat() {
-    restoreSoft();
-    restoreHard(state.chatKey);
-    updateUI();
-  }
-
-  function handleRouteChange() {
-    const nextKey = getChatKey();
-    if (nextKey === state.chatKey) return;
-
-    restoreCurrentChat();
-    state.hardArchived = state.hardArchived.filter((item) = item.chatKey !== state.chatKey);
-
-    state.chatKey = nextKey;
-    setStatus('Открыт другой чат.');
-    updateUI();
-  }
-
-  function runMaintenance() {
-    ensureUI();
-    handleRouteChange();
-
-    if (!cfg.enabled) {
-      setStatus('Антилаг выключен.');
-      updateUI();
-      return;
-    }
-
-    if (!nearBottom()) {
-      setStatus(`Ожидание прокрутка не у нижней границы чата (${getModeLabel(getEffectiveMode())}).`);
-      updateUI();
-      return;
-    }
-
-    const effectiveMode = getEffectiveMode();
-
-    if (effectiveMode === 'hard') {
-      const archived = archiveHard();
-      if (archived  0) {
-        setStatus(`Жёсткий режим скрыто ${archived} сообщений.`);
-      } else if (getHardHiddenCount()  0) {
-        setStatus('Жёсткий режим активен.');
-      } else {
-        setStatus('Жёсткий режим изменений нет.');
-      }
+    if (state.cfg.mode === 'auto') {
+      state.ui.modeBtn.title = `Автоматический режим. Сейчас выбран: ${getModeLabel(effectiveMode)}.`;
+    } else if (state.cfg.mode === 'soft') {
+      state.ui.modeBtn.title = 'Мягкий режим: старые сообщения скрываются только у нижней границы чата.';
     } else {
-      if (getHardHiddenCount()  0) {
-        restoreHard(state.chatKey);
-      }
-      const hidden = archiveSoft();
-      if (hidden  0) {
-        setStatus(`Мягкий режим скрыто ${hidden} сообщений.`);
-      } else if (getSoftHiddenCount()  0) {
-        setStatus('Мягкий режим активен.');
-      } else {
-        setStatus('Мягкий режим изменений нет.');
-      }
+      state.ui.modeBtn.title = 'Жёсткий режим: сообщения вне экрана заменяются spacers с сохранением высоты.';
     }
-
-    updateUI();
-  }
-
-  function scheduleMaintenance() {
-    window.clearTimeout(state.maintenanceTimer);
-    state.maintenanceTimer = window.setTimeout(runMaintenance, cfg.DEBOUNCE_MS);
-  }
-
-  function applyEnabled() {
-    ensureUI();
-
-    if (!cfg.enabled) {
-      restoreCurrentChat();
-      setStatus('Антилаг выключен.');
-    } else {
-      setStatus(`Антилаг включён. Текущий режим ${getModeLabel(getEffectiveMode())}.`);
-      scheduleMaintenance();
-    }
-
-    updateUI();
-  }
-
-  function patchHistory() {
-    if (state.historyPatched) return;
-    state.historyPatched = true;
-
-    const fire = () = window.setTimeout(scheduleMaintenance, 0);
-
-    const origPushState = history.pushState;
-    history.pushState = function () {
-      const ret = origPushState.apply(this, arguments);
-      fire();
-      return ret;
-    };
-
-    const origReplaceState = history.replaceState;
-    history.replaceState = function () {
-      const ret = origReplaceState.apply(this, arguments);
-      fire();
-      return ret;
-    };
-
-    window.addEventListener('popstate', fire, true);
-  }
-
-  function startObserver() {
-    if (state.observer  !document.body) return;
-
-    state.observer = new MutationObserver((mutations) = {
-      let shouldRun = false;
-
-      for (const m of mutations) {
-        if (state.ui.root && state.ui.root.contains(m.target)) continue;
-        shouldRun = true;
-        break;
-      }
-
-      if (shouldRun) {
-        scheduleMaintenance();
-      }
-    });
-
-    state.observer.observe(document.body, {
-      childList true,
-      subtree true
-    });
   }
 
   function start() {
@@ -871,16 +1031,21 @@
     ensureUI();
     patchHistory();
     startObserver();
-    applyEnabled();
+    attachOrUpdateScrollListener();
+    setStatus(`Антилаг включён. Текущий режим: ${getModeLabel(getEffectiveMode())}.`);
+    updateUI();
 
-    window.setInterval(runMaintenance, cfg.FALLBACK_TICK_MS);
-    window.setTimeout(runMaintenance, 350);
-    window.setTimeout(runMaintenance, 1200);
+    state.fallbackTimer = window.setInterval(() => {
+      scheduleMaintenance(0);
+    }, state.cfg.FALLBACK_TICK_MS);
+
+    scheduleMaintenance(200);
+    window.setTimeout(() => scheduleMaintenance(0), 1200);
   }
 
   if (document.body) {
     start();
   } else {
-    window.addEventListener('DOMContentLoaded', start, { once true });
+    window.addEventListener('DOMContentLoaded', start, { once: true });
   }
 })();
