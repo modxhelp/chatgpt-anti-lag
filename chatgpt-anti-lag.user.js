@@ -1,10 +1,10 @@
 // ==UserScript==
-// @name         ChatGPT Anti-Lag
-// @name:ru      ChatGPT Anti-Lag — облегчение длинных чатов
+// @name         ChatGPT Anti-Lag Archive
+// @name:ru      ChatGPT Anti-Lag — архиватор длинных чатов
 // @namespace    https://chatgpt.com/
-// @version      1.2.0
-// @description  Makes long ChatGPT chats lighter by hiding or virtualizing old messages, with a compact control panel.
-// @description:ru  Уменьшает лаги в длинных чатах ChatGPT: скрывает или виртуализирует старые сообщения и даёт быстрое управление.
+// @version      2.0.0
+// @description  Archives old ChatGPT messages to IndexedDB and keeps only the latest few messages in the live DOM.
+// @description:ru  Архивирует старые сообщения ChatGPT в IndexedDB и оставляет в живом DOM только последние несколько сообщений.
 // @author       Nikita + ChatGPT
 // @match        https://chatgpt.com/*
 // @match        https://chat.openai.com/*
@@ -15,31 +15,24 @@
 (function () {
   'use strict';
 
-  const LS_KEY = 'cg_anti_lag_cfg_v120';
-  const UI_ID = 'cg-anti-lag-root';
+  const LS_KEY = 'cg_anti_lag_archive_cfg_v200';
+  const UI_ID = 'cg-anti-lag-archive-root';
+  const ARCHIVE_BLOCK_ID = 'cg-archive-block';
   const PRIMARY_ARTICLE_SELECTOR = 'article[data-testid^="conversation-turn-"]';
   const FALLBACK_ARTICLE_SELECTOR = '[data-message-author-role]';
-  const HARD_SPACER_SELECTOR = '[data-cg-hard-spacer="1"]';
+  const ARCHIVE_DB_NAME = 'cgAntiLagArchiveDB';
+  const ARCHIVE_DB_VERSION = 1;
+  const ARCHIVE_STORE = 'chatArchives';
+  const BOOT_RETRY_DELAYS_MS = [600, 1200, 2500, 4000];
 
   const defaults = {
     enabled: true,
-    mode: 'soft',
-    KEEP_OPEN: 4,
-    MIN_KEEP: 1,
-    MAX_KEEP: 25,
-    SOFT_NEAR_BOTTOM_PX: 280,
-    HARD_MARGIN_PX: 1800,
+    KEEP_OPEN: 3,
     DEBOUNCE_MS: 120,
     MUTATION_DEBOUNCE_MS: 80,
     SCROLL_THROTTLE_MS: 50,
     URL_CHECK_INTERVAL_MS: 1000,
-    FALLBACK_TICK_MS: 2500,
     panelCollapsed: false,
-  };
-
-  const MODE_LABELS = {
-    soft: 'Мягкий',
-    hard: 'Жёсткий',
   };
 
   const state = {
@@ -48,27 +41,36 @@
     started: false,
     historyPatched: false,
     observer: null,
+    observerRoot: null,
     scrollElement: null,
     cleanupScrollListener: null,
-    articleMap: new Map(),
-    nextVirtualId: 1,
     maintenanceTimer: 0,
-    fallbackTimer: 0,
+    bootRetryTimers: [],
+    routeWatchTimer: 0,
     lastUrl: location.href,
     currentChatKey: getChatKey(),
     statusText: 'Ожидание.',
-    appliedMode: null,
-    softCollapsed: false,
     suppressScrollUntil: 0,
+    suppressObserverUntil: 0,
     lastScrollTop: 0,
     lastUserScrollAt: 0,
     lastScrollDirection: 'none',
+    lastUiSignature: '',
+    runInProgress: false,
+    pendingRun: false,
+    archive: {
+      chatKey: getChatKey(),
+      sessionInitialized: false,
+      items: [],
+      expanded: false,
+      blockEl: null,
+      inMemoryCount: 0,
+    },
     stats: {
       totalMessages: 0,
-      renderedMessages: 0,
-      softHiddenMessages: 0,
-      hardSpacerMessages: 0,
-      savedPercent: 0,
+      liveMessages: 0,
+      archivedMessages: 0,
+      restoredMessages: 0,
     },
   };
 
@@ -85,18 +87,74 @@
       contain-intrinsic-size: 700px 400px;
     }
 
-    .cg-soft-hidden {
-      display: none !important;
+    .cg-archive-restored {
+      opacity: 0;
+      transform: translateY(8px);
+      transition: opacity 0.18s ease-out, transform 0.18s ease-out;
     }
 
-    .cg-hard-spacer {
-      display: block !important;
-      width: 100% !important;
-      min-height: 24px;
-      pointer-events: none !important;
-      opacity: 0 !important;
-      user-select: none !important;
-      contain: strict;
+    .cg-archive-restored.cg-archive-restored-show {
+      opacity: 1;
+      transform: translateY(0);
+    }
+
+    #${ARCHIVE_BLOCK_ID} {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 10px 14px;
+      margin: 14px 0;
+      border-radius: 16px;
+      background: rgba(17, 24, 39, 0.92);
+      color: #f9fafb;
+      box-shadow: 0 8px 24px rgba(0,0,0,0.18);
+      backdrop-filter: blur(8px);
+    }
+
+    #${ARCHIVE_BLOCK_ID} .cg-archive-meta {
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+      min-width: 0;
+    }
+
+    #${ARCHIVE_BLOCK_ID} .cg-archive-title {
+      font-weight: 700;
+      font-size: 13px;
+    }
+
+    #${ARCHIVE_BLOCK_ID} .cg-archive-sub {
+      font-size: 12px;
+      opacity: 0.8;
+      word-break: break-word;
+    }
+
+    #${ARCHIVE_BLOCK_ID} .cg-archive-actions {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex: 0 0 auto;
+    }
+
+    #${ARCHIVE_BLOCK_ID} .cg-archive-btn {
+      border: 0;
+      border-radius: 999px;
+      padding: 7px 12px;
+      background: #374151;
+      color: #f9fafb;
+      cursor: pointer;
+      font: inherit;
+      transition: filter 0.14s ease-out, transform 0.14s ease-out;
+      white-space: nowrap;
+    }
+
+    #${ARCHIVE_BLOCK_ID} .cg-archive-btn:hover {
+      filter: brightness(1.08);
+    }
+
+    #${ARCHIVE_BLOCK_ID} .cg-archive-btn:active {
+      transform: translateY(1px);
     }
 
     #${UI_ID} {
@@ -124,7 +182,7 @@
       background: rgba(17, 24, 39, 0.96);
       box-shadow: 0 8px 24px rgba(0, 0, 0, 0.32);
       min-width: 238px;
-      max-width: 270px;
+      max-width: 280px;
       user-select: none;
       backdrop-filter: blur(8px);
     }
@@ -179,9 +237,7 @@
       opacity: 0.82;
     }
 
-    #${UI_ID} .cg-btn,
-    #${UI_ID} .cg-chip,
-    #${UI_ID} .cg-step {
+    #${UI_ID} .cg-btn {
       border: 0;
       color: #f9fafb;
       background: #374151;
@@ -189,54 +245,16 @@
       cursor: pointer;
       font: inherit;
       transition: filter 0.14s ease-out, transform 0.14s ease-out;
+      padding: 4px 8px;
+      min-height: 24px;
     }
 
-    #${UI_ID} .cg-btn:hover,
-    #${UI_ID} .cg-chip:hover,
-    #${UI_ID} .cg-step:hover {
+    #${UI_ID} .cg-btn:hover {
       filter: brightness(1.08);
     }
 
-    #${UI_ID} .cg-btn:active,
-    #${UI_ID} .cg-chip:active,
-    #${UI_ID} .cg-step:active {
+    #${UI_ID} .cg-btn:active {
       transform: translateY(1px);
-    }
-
-    #${UI_ID} .cg-btn {
-      padding: 4px 8px;
-      min-height: 24px;
-    }
-
-    #${UI_ID} .cg-chip {
-      padding: 4px 8px;
-      min-height: 24px;
-      min-width: 68px;
-      text-align: center;
-    }
-
-    #${UI_ID} .cg-keep-wrap {
-      display: inline-flex;
-      align-items: center;
-      gap: 4px;
-    }
-
-    #${UI_ID} .cg-step {
-      width: 22px;
-      height: 22px;
-      padding: 0;
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-      font-weight: 700;
-    }
-
-    #${UI_ID} .cg-keep-value,
-    #${UI_ID} .cg-hidden-value,
-    #${UI_ID} .cg-rendered-value {
-      min-width: 22px;
-      text-align: center;
-      font-weight: 700;
     }
 
     #${UI_ID} .cg-status {
@@ -255,6 +273,12 @@
 
     #${UI_ID} .cg-actions .cg-btn {
       flex: 1 1 auto;
+    }
+
+    #${UI_ID} .cg-value {
+      min-width: 22px;
+      text-align: center;
+      font-weight: 700;
     }
 
     #${UI_ID} .cg-switch {
@@ -293,14 +317,6 @@
     #${UI_ID}[data-enabled="false"] .cg-title {
       opacity: 0.65;
     }
-
-    #${UI_ID}[data-mode="soft"] .cg-chip {
-      background: #2563eb;
-    }
-
-    #${UI_ID}[data-mode="hard"] .cg-chip {
-      background: #b45309;
-    }
   `;
 
   addStyle(css);
@@ -327,17 +343,25 @@
     state.suppressScrollUntil = Math.max(state.suppressScrollUntil, nowMs() + Math.max(0, ms || 0));
   }
 
+  function suppressObserverReactions(ms) {
+    state.suppressObserverUntil = Math.max(state.suppressObserverUntil, nowMs() + Math.max(0, ms || 0));
+  }
+
   function shouldIgnoreScrollEvent() {
     return nowMs() < state.suppressScrollUntil;
   }
 
-  function clamp(n, min, max) {
-    return Math.min(max, Math.max(min, n));
+  function shouldIgnoreObserverEvent() {
+    return nowMs() < state.suppressObserverUntil;
   }
 
   function toInt(value, fallback) {
     const n = Number(value);
     return Number.isFinite(n) ? Math.round(n) : fallback;
+  }
+
+  function clamp(n, min, max) {
+    return Math.min(max, Math.max(min, n));
   }
 
   function loadCfg() {
@@ -353,17 +377,11 @@
   function mergeDefaults(obj) {
     const out = { ...defaults, ...(obj || {}) };
     out.enabled = Boolean(out.enabled);
-    out.mode = ['soft', 'hard'].includes(out.mode) ? out.mode : defaults.mode;
-    out.MIN_KEEP = Math.max(1, toInt(out.MIN_KEEP, defaults.MIN_KEEP));
-    out.MAX_KEEP = Math.max(out.MIN_KEEP, toInt(out.MAX_KEEP, defaults.MAX_KEEP));
-    out.KEEP_OPEN = clamp(toInt(out.KEEP_OPEN, defaults.KEEP_OPEN), out.MIN_KEEP, out.MAX_KEEP);
-    out.SOFT_NEAR_BOTTOM_PX = Math.max(0, toInt(out.SOFT_NEAR_BOTTOM_PX, defaults.SOFT_NEAR_BOTTOM_PX));
-    out.HARD_MARGIN_PX = Math.max(400, toInt(out.HARD_MARGIN_PX, defaults.HARD_MARGIN_PX));
+    out.KEEP_OPEN = clamp(toInt(out.KEEP_OPEN, defaults.KEEP_OPEN), 1, 10);
     out.DEBOUNCE_MS = Math.max(40, toInt(out.DEBOUNCE_MS, defaults.DEBOUNCE_MS));
     out.MUTATION_DEBOUNCE_MS = Math.max(20, toInt(out.MUTATION_DEBOUNCE_MS, defaults.MUTATION_DEBOUNCE_MS));
     out.SCROLL_THROTTLE_MS = Math.max(16, toInt(out.SCROLL_THROTTLE_MS, defaults.SCROLL_THROTTLE_MS));
     out.URL_CHECK_INTERVAL_MS = Math.max(300, toInt(out.URL_CHECK_INTERVAL_MS, defaults.URL_CHECK_INTERVAL_MS));
-    out.FALLBACK_TICK_MS = Math.max(800, toInt(out.FALLBACK_TICK_MS, defaults.FALLBACK_TICK_MS));
     out.panelCollapsed = Boolean(out.panelCollapsed);
     return out;
   }
@@ -378,19 +396,13 @@
     return `${location.pathname}${location.search}`;
   }
 
-  function getModeLabel(mode) {
-    return MODE_LABELS[mode] || mode;
-  }
-
   function setStatus(text) {
-    state.statusText = text || 'Ожидание.';
+    const next = text || 'Ожидание.';
+    if (state.statusText === next) return;
+    state.statusText = next;
     if (state.ui?.statusEl) {
       state.ui.statusEl.textContent = state.statusText;
     }
-  }
-
-  function isStreaming() {
-    return Boolean(document.querySelector('[data-testid="stop-button"]'));
   }
 
   function getPrimaryArticles() {
@@ -407,14 +419,12 @@
   function uniqueNodes(nodes) {
     const seen = new Set();
     const result = [];
-
     for (const node of nodes) {
       if (!(node instanceof HTMLElement)) continue;
       if (seen.has(node)) continue;
       seen.add(node);
       result.push(node);
     }
-
     return result;
   }
 
@@ -422,61 +432,72 @@
     if (!(node instanceof HTMLElement)) return false;
     if (!node.isConnected) return false;
     if (node.closest(`#${UI_ID}`)) return false;
-    if (node.dataset.cgHardSpacer === '1') return false;
+    if (node.id === ARCHIVE_BLOCK_ID) return false;
+    if (node.dataset.cgArchiveRestored === '1') return false;
+    if (node.dataset.cgArchiveSource === '1') return false;
     return true;
   }
 
-  function ensureVirtualIdsForArticles(articles) {
-    for (const article of articles) {
-      if (!(article instanceof HTMLElement)) continue;
+  function getConversationRoot() {
+    const firstMessage =
+      document.querySelector(PRIMARY_ARTICLE_SELECTOR) ||
+      document.querySelector(FALLBACK_ARTICLE_SELECTOR);
 
-      let id = article.dataset.cgVirtualId;
-      if (!id) {
-        id = String(state.nextVirtualId++);
-        article.dataset.cgVirtualId = id;
-      }
-
-      state.articleMap.set(id, article);
+    if (firstMessage instanceof HTMLElement) {
+      return firstMessage.parentElement || firstMessage.closest('main') || document.querySelector('main') || document.body;
     }
+
+    return document.querySelector('main') || document.body;
   }
 
   function getConversationNodes() {
-    const selector = `${PRIMARY_ARTICLE_SELECTOR}, ${HARD_SPACER_SELECTOR}`;
-    const nodes = Array.from(document.querySelectorAll(selector)).filter((node) => node instanceof HTMLElement);
-
-    if (nodes.length) return nodes;
-
-    return Array.from(document.querySelectorAll(`${FALLBACK_ARTICLE_SELECTOR}, ${HARD_SPACER_SELECTOR}`)).filter((node) => {
-      if (!(node instanceof HTMLElement)) return false;
-      if (node.matches(HARD_SPACER_SELECTOR)) return true;
-      return !node.closest('article') || node.closest('article') === node;
-    });
+    const articles = getPrimaryArticles();
+    const restored = getRestoredNodes();
+    const block = getArchiveBlock();
+    const nodes = [...articles];
+    if (block) nodes.push(block);
+    if (restored.length) nodes.push(...restored);
+    return nodes;
   }
 
-  function getRenderedArticles() {
-    return getPrimaryArticles();
+  function getRestoredNodes() {
+    return Array.from(document.querySelectorAll('[data-cg-archive-restored="1"]')).filter((node) => node instanceof HTMLElement);
   }
 
-  function getSoftHiddenNodes() {
-    return Array.from(document.querySelectorAll('[data-cg-soft-hidden="1"]'));
+  function getArchiveBlock() {
+    const el = document.getElementById(ARCHIVE_BLOCK_ID);
+    return el instanceof HTMLElement ? el : null;
   }
 
-  function getHardSpacerNodes() {
-    return Array.from(document.querySelectorAll(HARD_SPACER_SELECTOR));
+  function getVisibleLiveArticles() {
+    return getPrimaryArticles().filter((node) => node.dataset.cgArchiveRestored !== '1');
+  }
+
+  function getConversationStats() {
+    const liveArticles = getVisibleLiveArticles();
+    return {
+      totalMessages: liveArticles.length + state.archive.items.length,
+      liveMessages: liveArticles.length,
+      archivedMessages: state.archive.items.length,
+      restoredMessages: state.archive.expanded ? getRestoredNodes().length : 0,
+    };
   }
 
   function refreshStats() {
-    const totalMessages = getConversationNodes().length;
-    const softHiddenMessages = getSoftHiddenNodes().length;
-    const hardSpacerMessages = getHardSpacerNodes().length;
-    const renderedMessages = Math.max(0, totalMessages - softHiddenMessages - hardSpacerMessages);
-    const savedPercent = totalMessages > 0 ? Math.round(((softHiddenMessages + hardSpacerMessages) / totalMessages) * 100) : 0;
+    state.stats = getConversationStats();
+  }
 
-    state.stats.totalMessages = totalMessages;
-    state.stats.renderedMessages = renderedMessages;
-    state.stats.softHiddenMessages = softHiddenMessages;
-    state.stats.hardSpacerMessages = hardSpacerMessages;
-    state.stats.savedPercent = savedPercent;
+  function ensureArchiveIds(articles) {
+    let changed = false;
+    for (const article of articles) {
+      if (!(article instanceof HTMLElement)) continue;
+      if (!article.dataset.cgArchiveId) {
+        article.dataset.cgArchiveId = String(state.archive.inMemoryCount + 1 + state.archive.items.length);
+        state.archive.inMemoryCount += 1;
+        changed = true;
+      }
+    }
+    return changed;
   }
 
   function findScrollContainer() {
@@ -485,28 +506,17 @@
     }
 
     const firstMessage = document.querySelector(PRIMARY_ARTICLE_SELECTOR) || document.querySelector(FALLBACK_ARTICLE_SELECTOR);
-
     if (firstMessage instanceof HTMLElement) {
-      let bestCandidate = null;
       let ancestor = firstMessage.parentElement;
-
       while (ancestor && ancestor !== document.body && ancestor !== document.documentElement) {
         const styles = window.getComputedStyle(ancestor);
         const overflowY = styles.overflowY;
-        const isScrollableStyle = overflowY === 'auto' || overflowY === 'scroll' || overflowY === 'overlay';
-        if (isScrollableStyle) {
-          bestCandidate = ancestor;
-          if (ancestor.scrollHeight > ancestor.clientHeight + 8) {
-            state.scrollElement = ancestor;
-            return ancestor;
-          }
+        const isScrollable = (overflowY === 'auto' || overflowY === 'scroll' || overflowY === 'overlay') && ancestor.scrollHeight > ancestor.clientHeight + 8;
+        if (isScrollable) {
+          state.scrollElement = ancestor;
+          return ancestor;
         }
         ancestor = ancestor.parentElement;
-      }
-
-      if (bestCandidate) {
-        state.scrollElement = bestCandidate;
-        return bestCandidate;
       }
     }
 
@@ -514,286 +524,448 @@
     return state.scrollElement;
   }
 
-  function getViewportMetrics() {
-    const scrollElement = findScrollContainer();
+  function isMeaningfulMutationNode(node) {
+    if (!(node instanceof HTMLElement)) return false;
+    if (state.ui?.root && state.ui.root.contains(node)) return false;
+    if (node.id === ARCHIVE_BLOCK_ID) return false;
 
+    return Boolean(
+      node.matches?.(PRIMARY_ARTICLE_SELECTOR) ||
+      node.matches?.(FALLBACK_ARTICLE_SELECTOR) ||
+      node.querySelector?.(PRIMARY_ARTICLE_SELECTOR) ||
+      node.querySelector?.(FALLBACK_ARTICLE_SELECTOR)
+    );
+  }
+
+  function getScrollTop(scrollContainer) {
     if (
-      scrollElement instanceof HTMLElement &&
-      scrollElement !== document.body &&
-      scrollElement !== document.documentElement
+      scrollContainer instanceof HTMLElement &&
+      scrollContainer !== document.body &&
+      scrollContainer !== document.documentElement
     ) {
-      const rect = scrollElement.getBoundingClientRect();
-      return {
-        top: rect.top,
-        height: scrollElement.clientHeight,
-      };
+      return scrollContainer.scrollTop;
     }
+    const root = document.scrollingElement || document.documentElement;
+    return root.scrollTop;
+  }
 
-    return {
-      top: 0,
-      height: window.innerHeight,
+  function debounce(fn, wait) {
+    let timer = 0;
+    return function debounced() {
+      window.clearTimeout(timer);
+      timer = window.setTimeout(() => fn.apply(this, arguments), wait);
     };
   }
 
-  function isNearBottom() {
-    const scrollElement = findScrollContainer();
+  function openArchiveDb() {
+    return new Promise((resolve, reject) => {
+      const request = indexedDB.open(ARCHIVE_DB_NAME, ARCHIVE_DB_VERSION);
 
-    if (
-      scrollElement instanceof HTMLElement &&
-      scrollElement !== document.body &&
-      scrollElement !== document.documentElement
-    ) {
-      const dist = (scrollElement.scrollHeight - scrollElement.clientHeight) - scrollElement.scrollTop;
-      return dist <= state.cfg.SOFT_NEAR_BOTTOM_PX;
+      request.onupgradeneeded = () => {
+        const db = request.result;
+        if (!db.objectStoreNames.contains(ARCHIVE_STORE)) {
+          db.createObjectStore(ARCHIVE_STORE, { keyPath: 'chatKey' });
+        }
+      };
+
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error || new Error('Failed to open IndexedDB'));
+    });
+  }
+
+  async function withArchiveStore(mode, handler) {
+    const db = await openArchiveDb();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(ARCHIVE_STORE, mode);
+      const store = tx.objectStore(ARCHIVE_STORE);
+      let settled = false;
+
+      function finishOk(value) {
+        if (settled) return;
+        settled = true;
+        resolve(value);
+      }
+
+      function finishErr(error) {
+        if (settled) return;
+        settled = true;
+        reject(error);
+      }
+
+      tx.onabort = () => finishErr(tx.error || new Error('Archive transaction aborted'));
+      tx.onerror = () => finishErr(tx.error || new Error('Archive transaction failed'));
+
+      Promise.resolve(handler(store, finishOk, finishErr)).catch(finishErr);
+    }).finally(() => {
+      db.close();
+    });
+  }
+
+  async function readArchiveRecord(chatKey) {
+    return withArchiveStore('readonly', (store, finishOk, finishErr) => {
+      const req = store.get(chatKey);
+      req.onsuccess = () => finishOk(req.result || null);
+      req.onerror = () => finishErr(req.error || new Error('Failed to read archive record'));
+    });
+  }
+
+  async function writeArchiveRecord(record) {
+    return withArchiveStore('readwrite', (store, finishOk, finishErr) => {
+      const req = store.put(record);
+      req.onsuccess = () => finishOk(record);
+      req.onerror = () => finishErr(req.error || new Error('Failed to write archive record'));
+    });
+  }
+
+  async function clearArchiveRecord(chatKey) {
+    return withArchiveStore('readwrite', (store, finishOk, finishErr) => {
+      const req = store.delete(chatKey);
+      req.onsuccess = () => finishOk();
+      req.onerror = () => finishErr(req.error || new Error('Failed to clear archive record'));
+    });
+  }
+
+  async function ensureArchiveSessionReady() {
+    if (state.archive.sessionInitialized && state.archive.chatKey === state.currentChatKey) {
+      return;
     }
 
-    const root = document.scrollingElement || document.documentElement;
-    const dist = (root.scrollHeight - root.clientHeight) - root.scrollTop;
-    return dist <= state.cfg.SOFT_NEAR_BOTTOM_PX;
-  }
+    state.archive = {
+      chatKey: state.currentChatKey,
+      sessionInitialized: true,
+      items: [],
+      expanded: false,
+      blockEl: null,
+      inMemoryCount: 0,
+    };
 
-  function markSoftHidden(node) {
-    if (!(node instanceof HTMLElement)) return;
-    if (node.dataset.cgSoftHidden === '1') return;
-    node.dataset.cgSoftHidden = '1';
-    node.classList.add('cg-soft-hidden');
-    node.setAttribute('aria-hidden', 'true');
-  }
-
-  function unmarkSoftHidden(node) {
-    if (!(node instanceof HTMLElement)) return;
-    delete node.dataset.cgSoftHidden;
-    node.classList.remove('cg-soft-hidden');
-    node.removeAttribute('aria-hidden');
-  }
-
-  function restoreSoft() {
-    for (const node of getSoftHiddenNodes()) {
-      unmarkSoftHidden(node);
+    try {
+      await clearArchiveRecord(state.currentChatKey);
+    } catch (error) {
+      console.warn('[ChatGPT Anti-Lag Archive] Failed to reset archive record:', error);
     }
   }
 
-  function convertArticleToSpacer(article) {
-    if (!(article instanceof HTMLElement) || !article.isConnected) return false;
+  function createArchiveBlock() {
+    const block = document.createElement('div');
+    block.id = ARCHIVE_BLOCK_ID;
+    block.innerHTML = `
+      <div class="cg-archive-meta">
+        <div class="cg-archive-title">Архив старых сообщений</div>
+        <div class="cg-archive-sub">Старые сообщения выгружены из DOM и сохранены локально.</div>
+      </div>
+      <div class="cg-archive-actions">
+        <button class="cg-archive-btn cg-archive-toggle" type="button">Показать</button>
+      </div>
+    `;
 
-    const id = article.dataset.cgVirtualId;
-    if (!id) return false;
+    block.querySelector('.cg-archive-toggle').addEventListener('click', async (event) => {
+      event.preventDefault();
+      event.stopPropagation();
 
-    const rect = article.getBoundingClientRect();
-    const height = Math.max(24, Math.round(rect.height || article.offsetHeight || 24));
+      if (state.archive.expanded) {
+        hideArchivedMessages();
+        scheduleMaintenance(0);
+      } else {
+        await showArchivedMessages();
+      }
+    });
 
-    const spacer = document.createElement('div');
-    spacer.className = 'cg-hard-spacer';
-    spacer.dataset.cgHardSpacer = '1';
-    spacer.dataset.cgVirtualId = id;
-    spacer.dataset.cgChatKey = state.currentChatKey;
-    spacer.style.height = `${height}px`;
-
-    state.articleMap.set(id, article);
-    article.replaceWith(spacer);
-    return true;
+    return block;
   }
 
-  function convertSpacerToArticle(spacer) {
-    if (!(spacer instanceof HTMLElement) || !spacer.isConnected) return false;
+  function updateArchiveBlock() {
+    const block = state.archive.blockEl || getArchiveBlock();
+    if (!(block instanceof HTMLElement)) return;
 
-    const id = spacer.dataset.cgVirtualId;
-    if (!id) return false;
+    const titleEl = block.querySelector('.cg-archive-title');
+    const subEl = block.querySelector('.cg-archive-sub');
+    const btn = block.querySelector('.cg-archive-toggle');
 
-    const original = state.articleMap.get(id);
-    if (!(original instanceof HTMLElement)) return false;
-    if (original.isConnected) return false;
+    const count = state.archive.items.length;
+    if (titleEl) {
+      titleEl.textContent = state.archive.expanded
+        ? `Архив показан: ${count} ${pluralRu(count, ['сообщение', 'сообщения', 'сообщений'])}`
+        : `Скрыто ${count} ${pluralRu(count, ['сообщение', 'сообщения', 'сообщений'])}`;
+    }
 
-    spacer.replaceWith(original);
-    return true;
-  }
+    if (subEl) {
+      subEl.textContent = state.archive.expanded
+        ? 'Показаны HTML-снимки старых сообщений из локального архива.'
+        : 'Старые сообщения выгружены из DOM и сохранены локально в IndexedDB.';
+    }
 
-  function restoreHard() {
-    const spacers = getHardSpacerNodes();
-    for (const spacer of spacers) {
-      convertSpacerToArticle(spacer);
+    if (btn) {
+      btn.textContent = state.archive.expanded ? 'Скрыть' : 'Показать';
     }
   }
 
-  function restoreAllForCurrentChat() {
-    suppressScrollReactions(200);
-    restoreHard();
-    restoreSoft();
-    state.softCollapsed = false;
+  function ensureArchiveBlock() {
+    if (state.archive.items.length === 0) {
+      removeArchiveBlock();
+      return;
+    }
+
+    let block = getArchiveBlock();
+    if (!(block instanceof HTMLElement)) {
+      block = createArchiveBlock();
+      state.archive.blockEl = block;
+    } else {
+      state.archive.blockEl = block;
+    }
+
+    const liveArticles = getVisibleLiveArticles();
+    const anchor = liveArticles[0] || null;
+
+    if (anchor && block !== anchor.previousSibling) {
+      anchor.parentNode.insertBefore(block, anchor);
+    } else if (!anchor && !block.isConnected) {
+      const root = getConversationRoot();
+      root?.prepend(block);
+    }
+
+    updateArchiveBlock();
+  }
+
+  function removeArchiveBlock() {
+    const block = getArchiveBlock();
+    if (block && block.isConnected) {
+      block.remove();
+    }
+    state.archive.blockEl = null;
+  }
+
+  async function persistArchiveState() {
+    const record = {
+      chatKey: state.currentChatKey,
+      items: state.archive.items,
+      updatedAt: Date.now(),
+    };
+
+    try {
+      await writeArchiveRecord(record);
+    } catch (error) {
+      console.warn('[ChatGPT Anti-Lag Archive] Failed to persist archive state:', error);
+    }
+  }
+
+  function serializeArticle(article) {
+    const id = article.dataset.cgArchiveId || String(Date.now()) + Math.random().toString(36).slice(2);
+    article.dataset.cgArchiveId = id;
+
+    return {
+      id,
+      html: article.outerHTML,
+      savedAt: Date.now(),
+    };
+  }
+
+  async function archiveOldMessages() {
+    if (state.archive.expanded) {
+      setStatus('Архив показан. Скрытие старых сообщений временно приостановлено.');
+      ensureArchiveBlock();
+      return;
+    }
+
+    const articles = getVisibleLiveArticles();
+    ensureArchiveIds(articles);
+
+    const keepLive = Math.max(1, state.cfg.KEEP_OPEN);
+    const archiveCount = Math.max(0, articles.length - keepLive);
+    if (archiveCount === 0) {
+      refreshStats();
+      setStatus('Архивировать пока нечего.');
+      ensureArchiveBlock();
+      return;
+    }
+
+    const toArchive = articles.slice(0, archiveCount);
+    const newItems = [];
+
+    suppressScrollReactions(140);
+    suppressObserverReactions(140);
+
+    for (const article of toArchive) {
+      if (!(article instanceof HTMLElement) || !article.isConnected) continue;
+      newItems.push(serializeArticle(article));
+      article.remove();
+    }
+
+    if (newItems.length > 0) {
+      state.archive.items.push(...newItems);
+      await persistArchiveState();
+    }
+
     refreshStats();
+    ensureArchiveBlock();
+    setStatus(`В архив выгружено ${state.archive.items.length} ${pluralRu(state.archive.items.length, ['сообщение', 'сообщения', 'сообщений'])}.`);
+  }
+
+  function parseHtmlSnapshots(items) {
+    const fragment = document.createDocumentFragment();
+    const restoredNodes = [];
+
+    for (const item of items) {
+      if (!item || typeof item.html !== 'string') continue;
+
+      const tpl = document.createElement('template');
+      tpl.innerHTML = item.html.trim();
+      const node = tpl.content.firstElementChild;
+      if (!(node instanceof HTMLElement)) continue;
+
+      node.dataset.cgArchiveRestored = '1';
+      node.classList.add('cg-archive-restored');
+      fragment.appendChild(node);
+      restoredNodes.push(node);
+    }
+
+    return { fragment, restoredNodes };
+  }
+
+  async function showArchivedMessages() {
+    if (state.archive.expanded) return;
+    if (state.archive.items.length === 0) return;
+
+    ensureArchiveBlock();
+
+    const block = state.archive.blockEl || getArchiveBlock();
+    if (!(block instanceof HTMLElement)) return;
+
+    const { fragment, restoredNodes } = parseHtmlSnapshots(state.archive.items);
+    if (!restoredNodes.length) return;
+
+    suppressScrollReactions(140);
+    suppressObserverReactions(140);
+
+    block.after(fragment);
+    state.archive.expanded = true;
+    updateArchiveBlock();
+    refreshStats();
+    setStatus(`Архив показан: ${restoredNodes.length} ${pluralRu(restoredNodes.length, ['сообщение', 'сообщения', 'сообщений'])}.`);
+
+    requestAnimationFrame(() => {
+      for (const node of restoredNodes) {
+        node.classList.add('cg-archive-restored-show');
+      }
+    });
+
     updateUI();
   }
 
-  function getTailProtectedIds(nodes) {
-    const ids = [];
-    for (const node of nodes) {
-      if (!(node instanceof HTMLElement)) continue;
-      const id = node.dataset.cgVirtualId;
-      if (!id) continue;
-      ids.push(id);
-    }
-
-    return new Set(ids.slice(-state.cfg.KEEP_OPEN));
-  }
-
-  function applySoftMode() {
-    const articles = getRenderedArticles();
-    ensureVirtualIdsForArticles(articles);
-
-    const nearBottom = isNearBottom();
-    const userMovedRecently = (nowMs() - state.lastUserScrollAt) < 900;
-    const userMovedUp = userMovedRecently && state.lastScrollDirection === 'up';
-
-    if (!nearBottom && state.softCollapsed && userMovedUp) {
-      suppressScrollReactions(120);
-      restoreSoft();
-      state.softCollapsed = false;
+  function hideArchivedMessages() {
+    const restoredNodes = getRestoredNodes();
+    if (!restoredNodes.length) {
+      state.archive.expanded = false;
+      updateArchiveBlock();
       refreshStats();
-      setStatus('Мягкий режим: показаны старые сообщения, потому что ты ушёл вверх по чату.');
-      return;
-    }
-
-    if (!nearBottom && !state.softCollapsed) {
-      refreshStats();
-      setStatus('Мягкий режим: чат не у нижней границы, старые сообщения оставлены видимыми.');
-      return;
-    }
-
-    if (!nearBottom && state.softCollapsed) {
-      refreshStats();
-      setStatus('Мягкий режим: сохранено текущее скрытие, пока не будет явной прокрутки вверх.');
-      return;
-    }
-
-    const keepFromIndex = Math.max(0, articles.length - state.cfg.KEEP_OPEN);
-    suppressScrollReactions(120);
-
-    for (let i = 0; i < articles.length; i += 1) {
-      const article = articles[i];
-      if (i < keepFromIndex) {
-        markSoftHidden(article);
-      } else {
-        unmarkSoftHidden(article);
-      }
-    }
-
-    state.softCollapsed = keepFromIndex > 0;
-    refreshStats();
-
-    if (state.stats.softHiddenMessages > 0) {
-      setStatus(`Мягкий режим: скрыто ${state.stats.softHiddenMessages} старых сообщений.`);
-    } else {
-      setStatus('Мягкий режим: скрывать пока нечего.');
-    }
-  }
-
-  function applyHardMode() {
-    if (isStreaming()) {
-      refreshStats();
-      setStatus('Жёсткий режим: ответ ещё генерируется, виртуализация ждёт.');
-      return;
-    }
-
-    state.softCollapsed = false;
-
-    const articles = getRenderedArticles();
-    ensureVirtualIdsForArticles(articles);
-
-    const nodes = getConversationNodes();
-    const keepTailIds = getTailProtectedIds(nodes);
-    const viewport = getViewportMetrics();
-
-    suppressScrollReactions(120);
-
-    for (const node of nodes) {
-      if (!(node instanceof HTMLElement)) continue;
-
-      const id = node.dataset.cgVirtualId;
-      const isTailProtected = id ? keepTailIds.has(id) : false;
-      const rect = node.getBoundingClientRect();
-      const relativeTop = rect.top - viewport.top;
-      const relativeBottom = rect.bottom - viewport.top;
-      const isOutside = relativeBottom < -state.cfg.HARD_MARGIN_PX || relativeTop > viewport.height + state.cfg.HARD_MARGIN_PX;
-
-      if (node.matches(HARD_SPACER_SELECTOR)) {
-        if (!isOutside || isTailProtected) {
-          convertSpacerToArticle(node);
-        }
-        continue;
-      }
-
-      if (isTailProtected) continue;
-      if (isOutside) {
-        convertArticleToSpacer(node);
-      }
-    }
-
-    refreshStats();
-
-    if (state.stats.hardSpacerMessages > 0) {
-      setStatus(`Жёсткий режим: виртуализировано ${state.stats.hardSpacerMessages} сообщений.`);
-    } else {
-      setStatus('Жёсткий режим: пока всё рядом с экраном.');
-    }
-  }
-
-  function runMaintenance() {
-    ensureUI();
-    handleRouteChange();
-    attachOrUpdateScrollListener();
-
-    if (!state.cfg.enabled) {
-      restoreAllForCurrentChat();
-      state.appliedMode = null;
-      setStatus('Антилаг выключен.');
       updateUI();
       return;
     }
 
-    const mode = state.cfg.mode;
+    suppressScrollReactions(120);
+    suppressObserverReactions(120);
 
-    if (state.appliedMode !== mode) {
-      suppressScrollReactions(160);
-      if (mode === 'hard') {
-        restoreSoft();
-        state.softCollapsed = false;
-      } else {
-        restoreHard();
-      }
-      state.appliedMode = mode;
+    for (const node of restoredNodes) {
+      node.remove();
     }
 
-    if (mode === 'hard') {
-      applyHardMode();
-    } else {
-      applySoftMode();
-    }
-
+    state.archive.expanded = false;
+    updateArchiveBlock();
     refreshStats();
+    setStatus(`Архив снова скрыт: ${state.archive.items.length} ${pluralRu(state.archive.items.length, ['сообщение', 'сообщения', 'сообщений'])}.`);
     updateUI();
+  }
+
+  async function disableAndRestoreAll() {
+    suppressScrollReactions(160);
+    suppressObserverReactions(160);
+
+    if (!state.archive.expanded && state.archive.items.length) {
+      await showArchivedMessages();
+    }
+
+    removeArchiveBlock();
+
+    try {
+      await clearArchiveRecord(state.currentChatKey);
+    } catch (error) {
+      console.warn('[ChatGPT Anti-Lag Archive] Failed to clear current archive on disable:', error);
+    }
+
+    state.archive.items = [];
+    state.archive.expanded = false;
+    state.archive.blockEl = null;
+    refreshStats();
+    setStatus('Архиватор выключен. Все доступные сообщения показаны.');
+    updateUI();
+  }
+
+  async function runMaintenance() {
+    if (state.runInProgress) {
+      state.pendingRun = true;
+      return;
+    }
+
+    state.runInProgress = true;
+
+    try {
+      ensureUI();
+      handleRouteChange();
+      attachOrUpdateScrollListener();
+      startObserver();
+      await ensureArchiveSessionReady();
+
+      if (!state.cfg.enabled) {
+        await disableAndRestoreAll();
+        return;
+      }
+
+      ensureArchiveBlock();
+      await archiveOldMessages();
+      refreshStats();
+      updateUI();
+    } catch (error) {
+      console.error('[ChatGPT Anti-Lag Archive] Maintenance failed:', error);
+      setStatus('Произошла ошибка архиватора. Открой консоль для деталей.');
+      updateUI();
+    } finally {
+      state.runInProgress = false;
+
+      if (state.pendingRun) {
+        state.pendingRun = false;
+        scheduleMaintenance(0);
+      }
+    }
   }
 
   function scheduleMaintenance(delay) {
     window.clearTimeout(state.maintenanceTimer);
-    state.maintenanceTimer = window.setTimeout(runMaintenance, typeof delay === 'number' ? delay : state.cfg.DEBOUNCE_MS);
+    state.maintenanceTimer = window.setTimeout(() => {
+      void runMaintenance();
+    }, typeof delay === 'number' ? delay : state.cfg.DEBOUNCE_MS);
   }
 
   function handleRouteChange() {
     const currentUrl = location.href;
     const currentChatKey = getChatKey();
-
     if (currentUrl === state.lastUrl && currentChatKey === state.currentChatKey) return;
 
-    restoreAllForCurrentChat();
-    state.articleMap.clear();
-    state.nextVirtualId = 1;
-    state.appliedMode = null;
-    state.lastScrollTop = 0;
-    state.lastUserScrollAt = 0;
-    state.lastScrollDirection = 'none';
+    removeArchiveBlock();
+    hideArchivedMessages();
+
     state.lastUrl = currentUrl;
     state.currentChatKey = currentChatKey;
-    setStatus('Открыт другой чат.');
+    state.scrollElement = null;
+    state.archive = {
+      chatKey: currentChatKey,
+      sessionInitialized: false,
+      items: [],
+      expanded: false,
+      blockEl: null,
+      inMemoryCount: 0,
+    };
+    setStatus('Открыт другой чат. Архив будет собран заново.');
+    updateUI();
   }
 
   function patchHistory() {
@@ -817,7 +989,8 @@
     };
 
     window.addEventListener('popstate', fire, true);
-    window.setInterval(() => {
+
+    state.routeWatchTimer = window.setInterval(() => {
       if (location.href !== state.lastUrl) {
         fire();
       }
@@ -840,12 +1013,8 @@
     state.scrollElement = container;
     state.cleanupScrollListener = setupScrollTracking(container, () => {
       if (!state.cfg.enabled) return;
-
-      if (state.cfg.mode === 'hard') {
-        scheduleMaintenance(0);
-      } else if (state.cfg.mode === 'soft' && !isNearBottom()) {
-        scheduleMaintenance(0);
-      }
+      if (state.archive.expanded) return;
+      scheduleMaintenance(0);
     });
   }
 
@@ -853,26 +1022,14 @@
     let lastCheckTime = 0;
     let frameId = null;
 
-    const getScrollTop = () => {
-      if (
-        scrollContainer instanceof HTMLElement &&
-        scrollContainer !== document.body &&
-        scrollContainer !== document.documentElement
-      ) {
-        return scrollContainer.scrollTop;
-      }
-      const root = document.scrollingElement || document.documentElement;
-      return root.scrollTop;
-    };
-
-    state.lastScrollTop = getScrollTop();
+    state.lastScrollTop = getScrollTop(scrollContainer);
 
     const runCheck = () => {
       const currentTime = nowMs();
       if (currentTime - lastCheckTime < state.cfg.SCROLL_THROTTLE_MS) return;
       lastCheckTime = currentTime;
 
-      const currentScrollTop = getScrollTop();
+      const currentScrollTop = getScrollTop(scrollContainer);
       const delta = currentScrollTop - state.lastScrollTop;
 
       if (!shouldIgnoreScrollEvent()) {
@@ -907,33 +1064,80 @@
   }
 
   function startObserver() {
-    if (state.observer || !document.body) return;
+    const root = getConversationRoot();
+    if (!root) return;
 
-    const onMutation = debounce(() => {
+    if (state.observer && state.observerRoot === root && root.isConnected) {
+      return;
+    }
+
+    if (state.observer) {
+      state.observer.disconnect();
+      state.observer = null;
+      state.observerRoot = null;
+    }
+
+    const onMutation = debounce((mutations) => {
+      if (shouldIgnoreObserverEvent()) return;
+
+      let meaningful = false;
+
+      for (const mutation of mutations) {
+        if (state.ui?.root && state.ui.root.contains(mutation.target)) continue;
+
+        for (const node of mutation.addedNodes) {
+          if (isMeaningfulMutationNode(node)) {
+            meaningful = true;
+            break;
+          }
+        }
+
+        if (meaningful) break;
+
+        for (const node of mutation.removedNodes) {
+          if (isMeaningfulMutationNode(node)) {
+            meaningful = true;
+            break;
+          }
+        }
+
+        if (meaningful) break;
+      }
+
+      if (!meaningful) return;
+
       attachOrUpdateScrollListener();
       scheduleMaintenance(0);
     }, state.cfg.MUTATION_DEBOUNCE_MS);
 
     state.observer = new MutationObserver((mutations) => {
-      for (const mutation of mutations) {
-        if (state.ui?.root && state.ui.root.contains(mutation.target)) continue;
-        onMutation();
-        break;
-      }
+      onMutation(mutations);
     });
 
-    state.observer.observe(document.body, {
+    state.observer.observe(root, {
       childList: true,
       subtree: true,
     });
+
+    state.observerRoot = root;
   }
 
-  function debounce(fn, wait) {
-    let timer = 0;
-    return function debounced() {
-      window.clearTimeout(timer);
-      timer = window.setTimeout(() => fn.apply(this, arguments), wait);
-    };
+  function startBootRetries() {
+    for (const delay of BOOT_RETRY_DELAYS_MS) {
+      const timer = window.setTimeout(() => {
+        scheduleMaintenance(0);
+      }, delay);
+      state.bootRetryTimers.push(timer);
+    }
+  }
+
+  function pluralRu(n, forms) {
+    const value = Math.abs(Number(n)) % 100;
+    const num = value % 10;
+    if (value > 10 && value < 20) return forms[2];
+    if (num > 1 && num < 5) return forms[1];
+    if (num === 1) return forms[0];
+    return forms[2];
   }
 
   function ensureUI() {
@@ -945,43 +1149,34 @@
 
     root.innerHTML = `
       <div class="cg-pill">
-        <div class="cg-lightning" title="ChatGPT Anti-Lag">⚡</div>
+        <div class="cg-lightning" title="ChatGPT Anti-Lag Archive">🧊</div>
         <div class="cg-panel">
           <div class="cg-row">
-            <span class="cg-title">Антилаг</span>
-            <button class="cg-switch" type="button" aria-label="Включить или выключить Anti-Lag">
+            <span class="cg-title">Архиватор</span>
+            <button class="cg-switch" type="button" aria-label="Включить или выключить архиватор">
               <span class="cg-switch-knob"></span>
             </button>
           </div>
 
           <div class="cg-row">
-            <span class="cg-subtle">Режим</span>
-            <button class="cg-chip cg-mode" type="button">Мягкий</button>
+            <span class="cg-subtle">Живых</span>
+            <span class="cg-value">${state.cfg.KEEP_OPEN}</span>
           </div>
 
           <div class="cg-row">
-            <span class="cg-subtle">Оставлять</span>
-            <span class="cg-keep-wrap">
-              <button class="cg-step cg-dec" type="button" aria-label="Уменьшить количество">−</button>
-              <span class="cg-keep-value">4</span>
-              <button class="cg-step cg-inc" type="button" aria-label="Увеличить количество">+</button>
-            </span>
+            <span class="cg-subtle">В архиве</span>
+            <span class="cg-value cg-archived-value">0</span>
           </div>
 
           <div class="cg-row">
-            <span class="cg-subtle">Скрыто</span>
-            <span class="cg-hidden-value">0</span>
-          </div>
-
-          <div class="cg-row">
-            <span class="cg-subtle">Рендер</span>
-            <span class="cg-rendered-value">0</span>
+            <span class="cg-subtle">Показано</span>
+            <span class="cg-value cg-live-value">0</span>
           </div>
 
           <div class="cg-status">Ожидание.</div>
 
           <div class="cg-actions">
-            <button class="cg-btn cg-restore" type="button">Показать всё</button>
+            <button class="cg-btn cg-toggle-archive" type="button">Показать архив</button>
             <button class="cg-btn cg-collapse" type="button">Свернуть</button>
           </div>
         </div>
@@ -990,67 +1185,25 @@
 
     document.documentElement.appendChild(root);
 
-    root.querySelector('.cg-switch').addEventListener('click', (event) => {
+    root.querySelector('.cg-switch').addEventListener('click', async (event) => {
       event.preventDefault();
       event.stopPropagation();
       state.cfg.enabled = !state.cfg.enabled;
       saveCfg();
+      state.lastUiSignature = '';
       scheduleMaintenance(0);
     });
 
-    root.querySelector('.cg-mode').addEventListener('click', (event) => {
+    root.querySelector('.cg-toggle-archive').addEventListener('click', async (event) => {
       event.preventDefault();
       event.stopPropagation();
-      const order = ['soft', 'hard'];
-      const idx = order.indexOf(state.cfg.mode);
-      state.cfg.mode = order[(idx + 1) % order.length];
-      saveCfg();
-      state.appliedMode = null;
-      state.lastUserScrollAt = 0;
-      state.lastScrollDirection = 'none';
-      restoreAllForCurrentChat();
-      scheduleMaintenance(0);
-    });
 
-    root.querySelector('.cg-dec').addEventListener('click', (event) => {
-      event.preventDefault();
-      event.stopPropagation();
-      const next = clamp(state.cfg.KEEP_OPEN - 1, state.cfg.MIN_KEEP, state.cfg.MAX_KEEP);
-      if (next === state.cfg.KEEP_OPEN) return;
-      state.cfg.KEEP_OPEN = next;
-      saveCfg();
-      state.appliedMode = null;
-      state.lastUserScrollAt = 0;
-      state.lastScrollDirection = 'none';
-      restoreAllForCurrentChat();
-      scheduleMaintenance(0);
-    });
-
-    root.querySelector('.cg-inc').addEventListener('click', (event) => {
-      event.preventDefault();
-      event.stopPropagation();
-      const next = clamp(state.cfg.KEEP_OPEN + 1, state.cfg.MIN_KEEP, state.cfg.MAX_KEEP);
-      if (next === state.cfg.KEEP_OPEN) return;
-      state.cfg.KEEP_OPEN = next;
-      saveCfg();
-      state.appliedMode = null;
-      state.lastUserScrollAt = 0;
-      state.lastScrollDirection = 'none';
-      restoreAllForCurrentChat();
-      scheduleMaintenance(0);
-    });
-
-    root.querySelector('.cg-restore').addEventListener('click', (event) => {
-      event.preventDefault();
-      event.stopPropagation();
-      state.cfg.enabled = false;
-      saveCfg();
-      state.appliedMode = null;
-      state.lastUserScrollAt = 0;
-      state.lastScrollDirection = 'none';
-      restoreAllForCurrentChat();
-      setStatus('Все сообщения показаны. Антилаг выключен.');
-      updateUI();
+      if (state.archive.expanded) {
+        hideArchivedMessages();
+        scheduleMaintenance(0);
+      } else {
+        await showArchivedMessages();
+      }
     });
 
     root.querySelector('.cg-collapse').addEventListener('click', (event) => {
@@ -1058,6 +1211,7 @@
       event.stopPropagation();
       state.cfg.panelCollapsed = !state.cfg.panelCollapsed;
       saveCfg();
+      state.lastUiSignature = '';
       root.classList.toggle('cg-collapsed', state.cfg.panelCollapsed);
       updateUI();
     });
@@ -1067,17 +1221,17 @@
       if (event.target.closest('button')) return;
       state.cfg.panelCollapsed = false;
       saveCfg();
+      state.lastUiSignature = '';
       root.classList.remove('cg-collapsed');
       updateUI();
     });
 
     state.ui = {
       root,
-      modeBtn: root.querySelector('.cg-mode'),
-      keepValue: root.querySelector('.cg-keep-value'),
-      hiddenValue: root.querySelector('.cg-hidden-value'),
-      renderedValue: root.querySelector('.cg-rendered-value'),
+      archivedValue: root.querySelector('.cg-archived-value'),
+      liveValue: root.querySelector('.cg-live-value'),
       statusEl: root.querySelector('.cg-status'),
+      toggleArchiveBtn: root.querySelector('.cg-toggle-archive'),
       collapseBtn: root.querySelector('.cg-collapse'),
     };
 
@@ -1088,22 +1242,25 @@
     if (!state.ui) return;
 
     refreshStats();
-    const hiddenCount = state.stats.softHiddenMessages + state.stats.hardSpacerMessages;
+
+    const signature = [
+      state.cfg.enabled ? 1 : 0,
+      state.stats.archivedMessages,
+      state.stats.liveMessages,
+      state.archive.expanded ? 1 : 0,
+      state.statusText,
+      state.cfg.panelCollapsed ? 1 : 0,
+    ].join('|');
+
+    if (signature === state.lastUiSignature) return;
+    state.lastUiSignature = signature;
 
     state.ui.root.setAttribute('data-enabled', state.cfg.enabled ? 'true' : 'false');
-    state.ui.root.setAttribute('data-mode', state.cfg.mode);
-    state.ui.modeBtn.textContent = getModeLabel(state.cfg.mode);
-    state.ui.keepValue.textContent = String(state.cfg.KEEP_OPEN);
-    state.ui.hiddenValue.textContent = String(hiddenCount);
-    state.ui.renderedValue.textContent = String(state.stats.renderedMessages);
-    state.ui.collapseBtn.textContent = state.cfg.panelCollapsed ? 'Развернуть' : 'Свернуть';
+    state.ui.archivedValue.textContent = String(state.stats.archivedMessages);
+    state.ui.liveValue.textContent = String(state.stats.liveMessages);
     state.ui.statusEl.textContent = state.statusText;
-
-    if (state.cfg.mode === 'soft') {
-      state.ui.modeBtn.title = 'Мягкий режим: старые сообщения скрываются только у нижней границы чата.';
-    } else {
-      state.ui.modeBtn.title = 'Жёсткий режим: сообщения вне экрана заменяются spacers с сохранением высоты.';
-    }
+    state.ui.toggleArchiveBtn.textContent = state.archive.expanded ? 'Скрыть архив' : 'Показать архив';
+    state.ui.collapseBtn.textContent = state.cfg.panelCollapsed ? 'Развернуть' : 'Свернуть';
   }
 
   function start() {
@@ -1114,16 +1271,12 @@
     patchHistory();
     startObserver();
     attachOrUpdateScrollListener();
-    state.appliedMode = null;
-    setStatus(`Антилаг включён. Текущий режим: ${getModeLabel(state.cfg.mode)}.`);
+    setStatus(`Архиватор включён. В DOM будут оставаться последние ${state.cfg.KEEP_OPEN} сообщения.`);
     updateUI();
-
-    state.fallbackTimer = window.setInterval(() => {
-      scheduleMaintenance(0);
-    }, state.cfg.FALLBACK_TICK_MS);
 
     scheduleMaintenance(200);
     window.setTimeout(() => scheduleMaintenance(0), 1200);
+    startBootRetries();
   }
 
   if (document.body) {
