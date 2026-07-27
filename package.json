@@ -1,0 +1,15 @@
+{
+  "name": "chatgpt-anti-lag",
+  "version": "3.0.0",
+  "private": true,
+  "description": "Userscript that archives old ChatGPT messages locally to reduce DOM load in long chats.",
+  "license": "MIT",
+  "scripts": {
+    "check": "node --check chatgpt-anti-lag.user.js",
+    "test": "node scripts/validate-userscript.mjs",
+    "validate": "npm run check && npm test"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
